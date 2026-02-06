@@ -1,0 +1,1167 @@
+#!/usr/bin/env bash
+#
+# macos-security-audit
+# Comprehensive macOS security audit script.
+# Produces a Markdown report covering disk encryption, firewall, SIP,
+# Gatekeeper, network exposure, sharing services, user accounts,
+# persistence mechanisms, credentials, and more.
+#
+# Author:  fexxdev
+# License: MIT
+# Source:  https://github.com/fexxdev/macos-security-audit
+#
+# Usage:
+#   macos-security-audit                          # run with default output
+#   macos-security-audit --output report.md       # custom output path
+#   macos-security-audit --show-fix               # show fix commands after each finding
+#   macos-security-audit --show-fix --output r.md # combine flags
+#
+# The report is a Markdown file you can read, share, or diff over time.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+TOTAL_CHECKS=20
+
+# ── Colours / symbols for terminal output ────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+PASS="${GREEN}PASS${NC}"; FAIL="${RED}FAIL${NC}"; WARN="${YELLOW}WARN${NC}"; INFO="${CYAN}INFO${NC}"
+
+# ── Usage ─────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+macos-security-audit v${VERSION}
+
+Comprehensive macOS security audit with Markdown report generation.
+
+USAGE:
+    macos-security-audit [OPTIONS]
+
+OPTIONS:
+    --help          Show this help message
+    --output FILE   Custom markdown report path (default: ./security-audit-YYYY-MM-DD.md)
+    --show-fix      After each finding, print the fix command(s) in a copy-pasteable block
+
+EXAMPLES:
+    macos-security-audit
+    macos-security-audit --show-fix
+    macos-security-audit --output ~/Desktop/audit.md
+    macos-security-audit --show-fix --output report.md
+
+CHECKS PERFORMED (20):
+     1  Disk Encryption (FileVault)
+     2  System Integrity Protection (SIP)
+     3  Gatekeeper & Secure Boot
+     4  Firewall & Stealth Mode
+     5  Lockdown Mode
+     6  Software Updates
+     7  Network Exposure
+     8  Sharing Services
+     9  User Accounts & Authentication
+    10  SSH Configuration
+    11  Persistence Mechanisms
+    12  DNS & Network
+    13  Certificates & Trust Store
+    14  Installed Software Review
+    15  Bluetooth Discoverability
+    16  Location Services
+    17  Analytics & Telemetry Sharing
+    18  USB Restricted Mode
+    19  Wi-Fi Auto-Join for Open Networks
+    20  Touch ID
+EOF
+    exit 0
+}
+
+# ── Parse arguments ──────────────────────────────────────────────────
+DATE_STAMP=$(date +%Y-%m-%d)
+OUTPUT_FILE="security-audit-${DATE_STAMP}.md"
+SHOW_FIX=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help)    usage ;;
+        --output)  OUTPUT_FILE="${2:-$OUTPUT_FILE}"; shift 2 ;;
+        --show-fix) SHOW_FIX=true; shift ;;
+        *)
+            printf "${RED}Unknown option: %s${NC}\n" "$1"
+            printf "Run 'macos-security-audit --help' for usage.\n"
+            exit 1
+            ;;
+    esac
+done
+
+# Show-fix helper: prints a copy-pasteable fix block after a finding.
+show_fix() {
+    local description="$1"
+    shift
+    if $SHOW_FIX; then
+        echo ""
+        printf "  ${BOLD}${YELLOW}FIX:${NC} %s\n" "$description"
+        for cmd in "$@"; do
+            printf "  ${CYAN}\$${NC} %s\n" "$cmd"
+        done
+    fi
+}
+
+# ── Accumulators for the report ──────────────────────────────────────
+declare -a PASSES=()
+declare -a CRITICALS=()
+declare -a HIGHS=()
+declare -a MEDIUMS=()
+
+# Scoring: each finding adjusts a letter grade
+SCORE=100  # start at A+, deduct per finding
+
+pass()     { PASSES+=("$1"); printf "  ${PASS}  %s\n" "$1"; }
+critical() { CRITICALS+=("$(printf '%s\n\n%s' "$1" "$2")"); SCORE=$((SCORE - 8)); printf "  ${FAIL}  %s\n" "$1"; }
+high()     { HIGHS+=("$(printf '%s\n\n%s' "$1" "$2")"); SCORE=$((SCORE - 4)); printf "  ${WARN}  %s\n" "$1"; }
+medium()   { MEDIUMS+=("$(printf '%s\n\n%s' "$1" "$2")"); SCORE=$((SCORE - 2)); printf "  ${WARN}  %s\n" "$1"; }
+
+letter_grade() {
+    local s=$1
+    if   (( s >= 95 )); then echo "A+"
+    elif (( s >= 90 )); then echo "A"
+    elif (( s >= 85 )); then echo "A-"
+    elif (( s >= 80 )); then echo "B+"
+    elif (( s >= 75 )); then echo "B"
+    elif (( s >= 70 )); then echo "B-"
+    elif (( s >= 65 )); then echo "C+"
+    elif (( s >= 60 )); then echo "C"
+    elif (( s >= 55 )); then echo "C-"
+    elif (( s >= 50 )); then echo "D+"
+    elif (( s >= 45 )); then echo "D"
+    elif (( s >= 40 )); then echo "D-"
+    else echo "F"
+    fi
+}
+
+# ── Helpers ──────────────────────────────────────────────────────────
+cmd_exists()  { command -v "$1" &>/dev/null; }
+daemon_loaded() { launchctl list "$1" &>/dev/null; }
+
+# ── Header ───────────────────────────────────────────────────────────
+echo ""
+printf "${CYAN}╔══════════════════════════════════════════════════════╗${NC}\n"
+printf "${CYAN}║         macOS Security Audit — %s            ║${NC}\n" "$DATE_STAMP"
+printf "${CYAN}╚══════════════════════════════════════════════════════╝${NC}\n"
+echo ""
+
+HW_MODEL=$(sysctl -n hw.model 2>/dev/null || echo "Unknown")
+HW_CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Chip/{print $2}' || echo "Unknown")
+OS_VERSION=$(sw_vers -productVersion 2>/dev/null || echo "Unknown")
+OS_BUILD=$(sw_vers -buildVersion 2>/dev/null || echo "Unknown")
+SERIAL=$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Serial Number/{print $2; exit}' || echo "Unknown")
+
+printf "  Machine : %s (%s)\n" "$HW_MODEL" "$HW_CHIP"
+printf "  macOS   : %s (%s)\n" "$OS_VERSION" "$OS_BUILD"
+printf "  Serial  : %s\n" "$SERIAL"
+echo ""
+
+###############################################################################
+# 1. DISK ENCRYPTION
+###############################################################################
+printf "${CYAN}[1/${TOTAL_CHECKS}] Disk Encryption (FileVault)${NC}\n"
+if fdesetup status 2>/dev/null | grep -q "On"; then
+    pass "FileVault is ON"
+else
+    critical "FileVault is OFF" \
+"Your entire disk is readable if the device is lost or stolen.
+
+\`\`\`
+Fix: System Settings > Privacy & Security > FileVault > Turn On
+\`\`\`"
+    show_fix "Enable FileVault" \
+        "Open System Settings > Privacy & Security > FileVault > Turn On"
+fi
+
+###############################################################################
+# 2. SYSTEM INTEGRITY PROTECTION
+###############################################################################
+printf "${CYAN}[2/${TOTAL_CHECKS}] System Integrity Protection (SIP)${NC}\n"
+if csrutil status 2>/dev/null | grep -q "enabled"; then
+    pass "SIP is enabled"
+else
+    critical "SIP is DISABLED" \
+"System Integrity Protection prevents modification of protected system files and code injection into system processes. Without it, rootkits can persist trivially.
+
+\`\`\`
+Fix: Boot into Recovery Mode (hold Power on Apple Silicon) > Terminal > csrutil enable
+\`\`\`"
+    show_fix "Enable SIP (requires Recovery Mode)" \
+        "# Boot into Recovery Mode (hold Power on Apple Silicon)" \
+        "# Open Terminal from Utilities menu, then run:" \
+        "csrutil enable"
+fi
+
+###############################################################################
+# 3. GATEKEEPER & SECURE BOOT
+###############################################################################
+printf "${CYAN}[3/${TOTAL_CHECKS}] Gatekeeper & Secure Boot${NC}\n"
+if spctl --status 2>&1 | grep -q "enabled"; then
+    pass "Gatekeeper is enabled"
+else
+    critical "Gatekeeper is DISABLED" \
+"Unsigned / unnotarised apps can run without any warning.
+
+\`\`\`
+Fix: sudo spctl --master-enable
+\`\`\`"
+    show_fix "Enable Gatekeeper" \
+        "sudo spctl --master-enable"
+fi
+
+SECURE_BOOT=$(system_profiler SPiBridgeDataType 2>/dev/null | awk -F': ' '/Secure Boot/{print $2}')
+if [[ "$SECURE_BOOT" == *"Full"* ]]; then
+    pass "Secure Boot: Full Security"
+elif [[ -n "$SECURE_BOOT" ]]; then
+    high "Secure Boot: $SECURE_BOOT (not Full Security)" \
+"Reduced security allows older or modified kernels to boot.
+
+\`\`\`
+Fix: Boot into Recovery > Startup Security Utility > Full Security
+\`\`\`"
+    show_fix "Set Secure Boot to Full Security" \
+        "# Boot into Recovery > Startup Security Utility > Full Security"
+fi
+
+###############################################################################
+# 4. FIREWALL
+###############################################################################
+printf "${CYAN}[4/${TOTAL_CHECKS}] Firewall${NC}\n"
+FW_BIN="/usr/libexec/ApplicationFirewall/socketfilterfw"
+if "$FW_BIN" --getglobalstate 2>/dev/null | grep -q "enabled"; then
+    pass "Firewall is enabled"
+else
+    critical "Firewall is DISABLED" \
+"Your Mac accepts inbound connections from the network with no filtering.
+
+\`\`\`
+Fix: System Settings > Network > Firewall > Turn On
+\`\`\`"
+    show_fix "Enable Firewall" \
+        "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on"
+fi
+
+if "$FW_BIN" --getstealthmode 2>/dev/null | grep -qi "on\|enabled"; then
+    pass "Stealth Mode is ON"
+else
+    high "Stealth Mode is OFF" \
+"Your Mac responds to network probes (ping, port scans), making it visible on untrusted networks.
+
+\`\`\`
+Fix: System Settings > Network > Firewall > Options > Enable Stealth Mode
+\`\`\`"
+    show_fix "Enable Stealth Mode" \
+        "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode on"
+fi
+
+###############################################################################
+# 5. LOCKDOWN MODE
+###############################################################################
+printf "${CYAN}[5/${TOTAL_CHECKS}] Lockdown Mode${NC}\n"
+LDM_ENABLED=false
+if defaults read /Library/Managed\ Preferences/.GlobalPreferences LDMGlobalEnabled 2>/dev/null | grep -q "1"; then
+    LDM_ENABLED=true
+fi
+# Also check user-level
+if defaults read .GlobalPreferences LDMGlobalEnabled 2>/dev/null | grep -q "1"; then
+    LDM_ENABLED=true
+fi
+
+if $LDM_ENABLED; then
+    pass "Lockdown Mode is enabled"
+else
+    critical "Lockdown Mode is OFF" \
+"For a threat model that includes nation-state actors, Lockdown Mode is Apple's primary hardening feature. It restricts JIT, message attachments, inbound connections, config profiles, and more.
+
+\`\`\`
+Fix: System Settings > Privacy & Security > Lockdown Mode > Turn On
+Note: Some functionality will be limited (web fonts, certain message types, etc.)
+\`\`\`"
+    show_fix "Enable Lockdown Mode" \
+        "Open System Settings > Privacy & Security > Lockdown Mode > Turn On"
+fi
+
+###############################################################################
+# 6. SOFTWARE UPDATES
+###############################################################################
+printf "${CYAN}[6/${TOTAL_CHECKS}] Software Updates${NC}\n"
+# On macOS 26+ AutomaticCheckEnabled is absent when updates are on.
+# Check the keys that ARE present: AutomaticDownload, CriticalUpdateInstall,
+# AutomaticallyInstallMacOSUpdates, ConfigDataInstall.
+# If AutomaticCheckEnabled is explicitly "0", that's a real disable.
+AUTO_CHECK=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null || echo "missing")
+AUTO_DL=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload 2>/dev/null || echo "0")
+CRITICAL_INSTALL=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall 2>/dev/null || echo "0")
+AUTO_MACOS=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null || echo "0")
+CONFIG_DATA=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate ConfigDataInstall 2>/dev/null || echo "0")
+
+# "missing" means the key doesn't exist — macOS 26+ default is enabled.
+# Only flag if a key is explicitly "0".
+UPDATES_OK=true
+if [[ "$AUTO_CHECK" == "0" ]]; then UPDATES_OK=false; fi
+if [[ "$AUTO_DL" == "0" ]]; then UPDATES_OK=false; fi
+if [[ "$CRITICAL_INSTALL" == "0" ]]; then UPDATES_OK=false; fi
+if [[ "$AUTO_MACOS" == "0" ]]; then UPDATES_OK=false; fi
+
+if $UPDATES_OK; then
+    pass "Automatic security updates enabled"
+else
+    high "Automatic security updates not fully enabled" \
+"Critical patches may not be installed automatically, leaving known vulnerabilities open.
+
+\`\`\`
+Fix: System Settings > General > Software Update > Automatic Updates > enable all toggles
+\`\`\`"
+    show_fix "Enable automatic updates" \
+        "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled -bool true" \
+        "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool true" \
+        "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall -bool true" \
+        "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool true"
+fi
+
+PENDING=$(softwareupdate -l 2>&1)
+if echo "$PENDING" | grep -q "No new software available"; then
+    pass "macOS is up to date"
+else
+    high "Pending software updates available" \
+"$PENDING
+
+\`\`\`
+Fix: softwareupdate --install --all
+\`\`\`"
+    show_fix "Install pending updates" \
+        "sudo softwareupdate --install --all"
+fi
+
+###############################################################################
+# 7. NETWORK EXPOSURE
+###############################################################################
+printf "${CYAN}[7/${TOTAL_CHECKS}] Network Exposure${NC}\n"
+
+# Open listening ports on all interfaces (excluding localhost)
+OPEN_PORTS=$(lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null | grep -v "127.0.0.1\|::1" | tail -n +2 || true)
+
+if [[ -n "$OPEN_PORTS" ]]; then
+    # Build a readable list
+    PORT_LIST=$(echo "$OPEN_PORTS" | awk '{printf "  - %s (PID %s) on %s\n", $1, $2, $9}' | sort -u)
+    high "Services listening on all network interfaces" \
+"The following services are reachable by anyone on your local network:
+
+$PORT_LIST
+
+\`\`\`
+Fix: Bind services to 127.0.0.1 (localhost) or stop them if not needed.
+     For nginx: change 'listen 8080' to 'listen 127.0.0.1:8080' in nginx.conf
+     To stop nginx: brew services stop nginx
+\`\`\`"
+    show_fix "Stop exposed services (examples)" \
+        "brew services stop nginx" \
+        "# Or bind to localhost in service configuration"
+else
+    pass "No services exposed on all interfaces"
+fi
+
+# ICMP broadcast echo
+ICMP_BCAST=$(sysctl -n net.inet.icmp.bmcastecho 2>/dev/null || echo "0")
+if [[ "$ICMP_BCAST" == "1" ]]; then
+    high "ICMP broadcast echo is enabled" \
+"Your machine responds to broadcast pings, making it trivially discoverable on any network.
+
+\`\`\`
+Fix: sudo sysctl -w net.inet.icmp.bmcastecho=0
+     Persist: echo 'net.inet.icmp.bmcastecho=0' | sudo tee -a /etc/sysctl.conf
+\`\`\`"
+    show_fix "Disable ICMP broadcast echo" \
+        "sudo sysctl -w net.inet.icmp.bmcastecho=0"
+else
+    pass "ICMP broadcast echo disabled"
+fi
+
+###############################################################################
+# 8. SHARING SERVICES
+###############################################################################
+printf "${CYAN}[8/${TOTAL_CHECKS}] Sharing Services${NC}\n"
+
+# AirDrop
+AIRDROP_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "unknown")
+if [[ "$AIRDROP_MODE" == "Everyone" ]]; then
+    critical "AirDrop is set to 'Everyone'" \
+"Your Mac is discoverable by any nearby device. Proximity-based attacks and surveillance have used AirDrop as a vector.
+
+\`\`\`
+Fix: System Settings > General > AirDrop & Handoff > AirDrop > 'Contacts Only' or 'No One'
+\`\`\`"
+    show_fix "Set AirDrop to Contacts Only" \
+        "defaults write com.apple.sharingd DiscoverableMode -string 'Contacts Only'"
+elif [[ "$AIRDROP_MODE" == "Off" ]]; then
+    pass "AirDrop is OFF"
+else
+    pass "AirDrop is set to '${AIRDROP_MODE}'"
+fi
+
+# Screen Sharing
+if daemon_loaded com.apple.screensharing; then
+    high "Screen Sharing is enabled" \
+"Allows remote VNC-like access to your desktop.
+
+\`\`\`
+Fix: System Settings > General > Sharing > Disable 'Screen Sharing'
+\`\`\`"
+    show_fix "Disable Screen Sharing" \
+        "sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.screensharing.plist"
+else
+    pass "Screen Sharing is disabled"
+fi
+
+# File Sharing (SMB)
+if daemon_loaded com.apple.smbd; then
+    high "File Sharing (SMB) is enabled" \
+"Exposes file shares on the network.
+
+\`\`\`
+Fix: System Settings > General > Sharing > Disable 'File Sharing'
+\`\`\`"
+    show_fix "Disable File Sharing" \
+        "sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.smbd.plist"
+else
+    pass "File Sharing (SMB) is disabled"
+fi
+
+# Remote Management (ARD)
+if daemon_loaded com.apple.RemoteDesktop.agent; then
+    critical "Remote Management (ARD) is loaded" \
+"Apple Remote Desktop agent is running. This allows remote control of your machine if exploited or misconfigured.
+
+\`\`\`
+Fix: System Settings > General > Sharing > Disable 'Remote Management'
+     Or via terminal: sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -deactivate -configure -access -off
+\`\`\`"
+    show_fix "Disable Remote Management (ARD)" \
+        "sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -deactivate -configure -access -off"
+else
+    pass "Remote Management (ARD) is disabled"
+fi
+
+# SSH / Remote Login
+SSH_STATUS=$(systemsetup -getremotelogin 2>/dev/null || echo "")
+if echo "$SSH_STATUS" | grep -qi "on"; then
+    high "Remote Login (SSH) is enabled" \
+"SSH access is available. Ensure it's intentional and key-only auth is configured.
+
+\`\`\`
+Fix: System Settings > General > Sharing > Disable 'Remote Login'
+     Or harden: PasswordAuthentication no in /etc/ssh/sshd_config
+\`\`\`"
+    show_fix "Disable Remote Login" \
+        "sudo systemsetup -setremotelogin off"
+else
+    pass "Remote Login (SSH) is disabled"
+fi
+
+###############################################################################
+# 9. USER ACCOUNTS & AUTHENTICATION
+###############################################################################
+printf "${CYAN}[9/${TOTAL_CHECKS}] User Accounts & Authentication${NC}\n"
+
+# Auto-login
+if defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser &>/dev/null; then
+    critical "Auto-login is ENABLED" \
+"Anyone who opens the laptop lid gets full access — no password required.
+
+\`\`\`
+Fix: System Settings > Users & Groups > Disable automatic login
+\`\`\`"
+    show_fix "Disable auto-login" \
+        "sudo defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser"
+else
+    pass "Auto-login is disabled"
+fi
+
+# Admin users
+ADMIN_USERS=$(dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/GroupMembership: //' || echo "")
+ADMIN_COUNT=$(echo "$ADMIN_USERS" | wc -w | tr -d ' ')
+if (( ADMIN_COUNT > 2 )); then  # root + 1 user is normal
+    medium "Multiple admin accounts: $ADMIN_USERS" \
+"More admin accounts = larger attack surface. Use a standard account for daily use.
+
+\`\`\`
+Fix: System Settings > Users & Groups > demote unnecessary admins to Standard
+\`\`\`"
+    show_fix "Demote unnecessary admin accounts" \
+        "# System Settings > Users & Groups > select user > change to Standard"
+else
+    pass "Admin users: $ADMIN_USERS"
+fi
+
+# Screen lock / password after sleep
+# Modern macOS (Sonoma+) no longer uses com.apple.screensaver askForPassword.
+# Use sysadminctl which works across all recent versions.
+SCREENLOCK_STATUS=$(sysadminctl -screenLock status 2>&1 || true)
+if echo "$SCREENLOCK_STATUS" | grep -qi "immediate"; then
+    pass "Screen lock requires password immediately"
+elif echo "$SCREENLOCK_STATUS" | grep -qi "screenLock delay"; then
+    DELAY_INFO=$(echo "$SCREENLOCK_STATUS" | sed 's/.*screenLock delay is //')
+    medium "Screen lock delay is: ${DELAY_INFO}" \
+"An attacker with brief physical access could unlock the machine within the grace window.
+
+\`\`\`
+Fix: System Settings > Lock Screen > Require password after screen saver begins
+     or display is turned off: 'Immediately'
+\`\`\`"
+    show_fix "Set screen lock to immediate" \
+        "sysadminctl -screenLock immediate -password -"
+else
+    # Fallback: try legacy defaults approach
+    ASK_PWD=$(defaults read com.apple.screensaver askForPassword 2>/dev/null || echo "unknown")
+    ASK_DELAY=$(defaults read com.apple.screensaver askForPasswordDelay 2>/dev/null || echo "unknown")
+    if [[ "$ASK_PWD" == "1" && "$ASK_DELAY" == "0" ]]; then
+        pass "Screen lock requires password immediately"
+    elif [[ "$ASK_PWD" == "1" ]]; then
+        medium "Screen lock has a grace period of ${ASK_DELAY}s before requiring password" \
+"An attacker with brief physical access could unlock the machine within the grace window.
+
+\`\`\`
+Fix: System Settings > Lock Screen > Require password: 'Immediately'
+\`\`\`"
+        show_fix "Set screen lock to immediate" \
+            "defaults write com.apple.screensaver askForPasswordDelay -int 0"
+    else
+        medium "Could not confirm screen lock requires password immediately" \
+"Verify manually that password is required immediately on sleep/screensaver.
+
+\`\`\`
+Fix: System Settings > Lock Screen > Require password: 'Immediately'
+\`\`\`"
+    fi
+fi
+
+# Keychain lock timeout
+KC_INFO=$(security show-keychain-info ~/Library/Keychains/login.keychain-db 2>&1 || true)
+if echo "$KC_INFO" | grep -q "no-timeout"; then
+    high "Login keychain has no lock timeout" \
+"Once unlocked at login, your keychain stays unlocked forever. Malware with code execution can extract all stored secrets without re-prompting.
+
+\`\`\`
+Fix: security set-keychain-settings -t 3600 -l ~/Library/Keychains/login.keychain-db
+     (locks after 1 hour of inactivity and on sleep)
+\`\`\`"
+    show_fix "Set keychain to lock after 1 hour and on sleep" \
+        "security set-keychain-settings -t 3600 -l ~/Library/Keychains/login.keychain-db"
+else
+    pass "Login keychain has a lock timeout configured"
+fi
+
+###############################################################################
+# 10. SSH CONFIGURATION
+###############################################################################
+printf "${CYAN}[10/${TOTAL_CHECKS}] SSH Configuration${NC}\n"
+
+AUTH_KEYS="$HOME/.ssh/authorized_keys"
+if [[ -f "$AUTH_KEYS" ]] && [[ -s "$AUTH_KEYS" ]]; then
+    KEY_COUNT=$(wc -l < "$AUTH_KEYS" | tr -d ' ')
+    high "$KEY_COUNT key(s) in authorized_keys — verify they are all yours" \
+"Any key listed here grants passwordless SSH access to this machine.
+
+\`\`\`
+Fix: Review ~/.ssh/authorized_keys and remove any unrecognised keys
+\`\`\`"
+    show_fix "Review authorized_keys" \
+        "cat ~/.ssh/authorized_keys" \
+        "# Remove unrecognised keys with a text editor"
+else
+    pass "No authorized_keys file (or empty)"
+fi
+
+SSH_DIR_PERMS=$(stat -f "%Lp" ~/.ssh 2>/dev/null || echo "")
+if [[ -n "$SSH_DIR_PERMS" && "$SSH_DIR_PERMS" != "700" ]]; then
+    medium "~/.ssh directory permissions are $SSH_DIR_PERMS (should be 700)" \
+"\`\`\`
+Fix: chmod 700 ~/.ssh
+\`\`\`"
+    show_fix "Fix ~/.ssh permissions" \
+        "chmod 700 ~/.ssh"
+elif [[ -n "$SSH_DIR_PERMS" ]]; then
+    pass "~/.ssh permissions are 700"
+fi
+
+###############################################################################
+# 11. PERSISTENCE MECHANISMS
+###############################################################################
+printf "${CYAN}[11/${TOTAL_CHECKS}] Persistence Mechanisms${NC}\n"
+
+# Third-party LaunchDaemons (run as root)
+THIRD_PARTY_DAEMONS=$(ls /Library/LaunchDaemons/ 2>/dev/null | grep -v '^com.apple' || true)
+if [[ -n "$THIRD_PARTY_DAEMONS" ]]; then
+    DAEMON_LIST=$(echo "$THIRD_PARTY_DAEMONS" | sed 's/^/  - /')
+
+    # Check specifically for TeamViewer
+    if echo "$THIRD_PARTY_DAEMONS" | grep -qi "teamviewer"; then
+        critical "TeamViewer LaunchDaemons are installed" \
+"TeamViewer has persistent system-level daemons running as root. TeamViewer has been repeatedly compromised (2016, 2019, 2024 breaches) and is a known target for intelligence services.
+
+Third-party LaunchDaemons found:
+$DAEMON_LIST
+
+**How to fully uninstall TeamViewer:**
+
+1. Quit TeamViewer if running
+2. Open Finder > Applications > right-click TeamViewer > Move to Trash
+3. Remove leftover system files:
+\`\`\`
+sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.Helper.plist
+sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.UninstallerHelper.plist
+sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.UninstallerWatcher.plist
+sudo rm /Library/LaunchDaemons/com.teamviewer.*
+sudo rm /Library/PrivilegedHelperTools/com.teamviewer.Helper
+sudo rm -rf /Library/Application\ Support/TeamViewer
+rm -rf ~/Library/Application\ Support/TeamViewer
+rm -rf ~/Library/Caches/com.teamviewer.*
+rm -rf ~/Library/Preferences/com.teamviewer*
+rm -rf ~/Library/Logs/TeamViewer
+\`\`\`
+4. Verify nothing remains:
+\`\`\`
+ls /Library/LaunchDaemons/com.teamviewer* 2>/dev/null && echo 'STILL PRESENT' || echo 'Clean'
+\`\`\`"
+        show_fix "Uninstall TeamViewer" \
+            "sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.Helper.plist" \
+            "sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.UninstallerHelper.plist" \
+            "sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.UninstallerWatcher.plist" \
+            "sudo rm /Library/LaunchDaemons/com.teamviewer.*" \
+            "sudo rm /Library/PrivilegedHelperTools/com.teamviewer.Helper" \
+            "sudo rm -rf '/Library/Application Support/TeamViewer'" \
+            "rm -rf ~/Library/Application\\ Support/TeamViewer" \
+            "rm -rf ~/Library/Caches/com.teamviewer.*" \
+            "rm -rf ~/Library/Preferences/com.teamviewer*" \
+            "rm -rf ~/Library/Logs/TeamViewer"
+    else
+        medium "Third-party LaunchDaemons found (run as root)" \
+"Review these for legitimacy — any of them could be a persistence backdoor:
+
+$DAEMON_LIST
+
+\`\`\`
+Fix: Investigate each one. Remove any that are not needed:
+     sudo launchctl unload /Library/LaunchDaemons/<plist>
+     sudo rm /Library/LaunchDaemons/<plist>
+\`\`\`"
+        show_fix "Remove unwanted LaunchDaemons (example)" \
+            "sudo launchctl unload /Library/LaunchDaemons/<plist-name>" \
+            "sudo rm /Library/LaunchDaemons/<plist-name>"
+    fi
+else
+    pass "No third-party LaunchDaemons"
+fi
+
+# User LaunchAgents
+USER_AGENTS=$(ls ~/Library/LaunchAgents/ 2>/dev/null || true)
+if [[ -n "$USER_AGENTS" ]]; then
+    AGENT_COUNT=$(echo "$USER_AGENTS" | wc -l | tr -d ' ')
+    AGENT_LIST=$(echo "$USER_AGENTS" | sed 's/^/  - /')
+    if (( AGENT_COUNT > 5 )); then
+        medium "$AGENT_COUNT user LaunchAgents found — review for legitimacy" \
+"$AGENT_LIST
+
+\`\`\`
+Fix: Review each one. Remove unneeded agents:
+     launchctl unload ~/Library/LaunchAgents/<plist>
+     rm ~/Library/LaunchAgents/<plist>
+\`\`\`"
+        show_fix "Remove unwanted LaunchAgents (example)" \
+            "launchctl unload ~/Library/LaunchAgents/<plist-name>" \
+            "rm ~/Library/LaunchAgents/<plist-name>"
+    else
+        pass "$AGENT_COUNT user LaunchAgents (review periodically)"
+    fi
+else
+    pass "No user LaunchAgents"
+fi
+
+# Cron jobs
+CRON_JOBS=$(crontab -l 2>/dev/null || true)
+if [[ -n "$CRON_JOBS" ]]; then
+    medium "Cron jobs found for current user" \
+"$CRON_JOBS
+
+\`\`\`
+Fix: Review with: crontab -l
+     Edit with:   crontab -e
+\`\`\`"
+    show_fix "Review cron jobs" \
+        "crontab -l" \
+        "# Edit with: crontab -e"
+else
+    pass "No cron jobs"
+fi
+
+###############################################################################
+# 12. DNS & NETWORK CONFIGURATION
+###############################################################################
+printf "${CYAN}[12/${TOTAL_CHECKS}] DNS & Network${NC}\n"
+
+DNS_SERVERS=$(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/{print $3}' | head -2 | sort -u | tr '\n' ', ' | sed 's/,$//')
+KNOWN_GOOD="1.1.1.1|1.0.0.1|8.8.8.8|8.8.4.4|9.9.9.9|149.112.112.112"
+if echo "$DNS_SERVERS" | grep -qE "$KNOWN_GOOD"; then
+    pass "DNS servers: $DNS_SERVERS (known privacy-respecting providers)"
+elif [[ -n "$DNS_SERVERS" ]]; then
+    medium "DNS servers: $DNS_SERVERS — not a well-known privacy DNS" \
+"Consider using encrypted DNS (1.1.1.1, 9.9.9.9, 8.8.8.8) to prevent DNS snooping.
+
+\`\`\`
+Fix: System Settings > Network > Wi-Fi > Details > DNS > add 1.1.1.1 and 1.0.0.1
+     Better: use a DNS-over-HTTPS client or configure it in your router
+\`\`\`"
+    show_fix "Set DNS to privacy-respecting providers" \
+        "networksetup -setdnsservers Wi-Fi 1.1.1.1 1.0.0.1"
+else
+    medium "Could not determine DNS servers" \
+"Verify DNS configuration manually."
+fi
+
+# /etc/hosts for production IPs
+HOSTS_EXTERNAL=$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' /etc/hosts 2>/dev/null | grep -v '127.0.0.1\|255.255.255.255\|0.0.0.0' || true)
+if [[ -n "$HOSTS_EXTERNAL" ]]; then
+    HOST_LIST=$(echo "$HOSTS_EXTERNAL" | sed 's/^/  /')
+    high "External/production IPs found in /etc/hosts" \
+"Your /etc/hosts contains non-local IP addresses. Anyone with access to your machine can see your infrastructure layout:
+
+$HOST_LIST
+
+\`\`\`
+Fix: Remove production IPs from /etc/hosts. Use a VPN + private DNS instead.
+\`\`\`"
+    show_fix "Edit /etc/hosts to remove external IPs" \
+        "sudo nano /etc/hosts"
+else
+    pass "No external IPs in /etc/hosts"
+fi
+
+# VPN status
+VPN_CONNS=$(scutil --nc list 2>/dev/null | grep -v "^Available\|^$" || true)
+VPN_PROCS=$(ps aux 2>/dev/null | grep -iE "openvpn|wireguard|privateinternet|pia|viscosity|mullvad|nordvpn" | grep -v grep || true)
+if [[ -n "$VPN_PROCS" ]]; then
+    pass "VPN process detected as running"
+elif [[ -n "$VPN_CONNS" ]]; then
+    medium "VPN configurations exist but no VPN appears to be running" \
+"You have VPN software installed but it's not currently active.
+
+\`\`\`
+Fix: Enable your VPN, especially on untrusted networks.
+     Consider always-on VPN configuration.
+\`\`\`"
+    show_fix "Enable your VPN" \
+        "# Start your VPN client or connect via:" \
+        "scutil --nc start 'VPN Connection Name'"
+else
+    medium "No VPN detected" \
+"No VPN connections or processes found. Use a VPN on untrusted networks.
+
+\`\`\`
+Fix: Install and configure a trusted VPN provider.
+\`\`\`"
+fi
+
+###############################################################################
+# 13. CERTIFICATES & TRUST STORE
+###############################################################################
+printf "${CYAN}[13/${TOTAL_CHECKS}] Certificates & Trust Store${NC}\n"
+
+# mkcert local CA
+MKCERT_ROOT=""
+if cmd_exists mkcert; then
+    MKCERT_ROOT=$(mkcert -CAROOT 2>/dev/null || true)
+fi
+if [[ -n "$MKCERT_ROOT" && -d "$MKCERT_ROOT" ]]; then
+    CA_KEY="$MKCERT_ROOT/rootCA-key.pem"
+    if [[ -f "$CA_KEY" ]]; then
+        KEY_PERMS=$(stat -f "%Lp" "$CA_KEY" 2>/dev/null || echo "unknown")
+        if [[ "$KEY_PERMS" != "600" ]]; then
+            high "mkcert root CA key has loose permissions ($KEY_PERMS)" \
+"mkcert has installed a local root CA. If the private key is stolen, an attacker can silently MITM all your HTTPS traffic.
+
+CA root: $MKCERT_ROOT
+Key permissions: $KEY_PERMS (should be 600)
+
+\`\`\`
+Fix: chmod 600 \"$CA_KEY\"
+     If not actively using mkcert: mkcert -uninstall
+\`\`\`"
+            show_fix "Fix mkcert CA key permissions" \
+                "chmod 600 \"$CA_KEY\""
+        else
+            pass "mkcert CA key permissions are 600"
+        fi
+    fi
+else
+    pass "No mkcert local CA detected"
+fi
+
+###############################################################################
+# 14. INSTALLED SOFTWARE REVIEW
+###############################################################################
+printf "${CYAN}[14/${TOTAL_CHECKS}] Installed Software Review${NC}\n"
+
+# Offensive / dual-use tools
+OFFENSIVE_TOOLS=""
+for tool in bettercap mitmproxy nmap wireshark sherlock hydra john hashcat metasploit msfconsole aircrack-ng; do
+    if cmd_exists "$tool"; then
+        OFFENSIVE_TOOLS="${OFFENSIVE_TOOLS}  - ${tool}\n"
+    fi
+done
+# Also check /Applications for GUI tools
+for app in Wireshark Burp\ Suite; do
+    if [[ -d "/Applications/${app}.app" ]]; then
+        OFFENSIVE_TOOLS="${OFFENSIVE_TOOLS}  - ${app} (GUI)\n"
+    fi
+done
+
+if [[ -n "$OFFENSIVE_TOOLS" ]]; then
+    medium "Offensive / dual-use security tools installed" \
+"While legitimate for security work, these increase attack surface and could be weaponised if your machine is compromised:
+
+$(echo -e "$OFFENSIVE_TOOLS")
+\`\`\`
+Fix: Uninstall any you're not actively using. Keep them in a VM if needed for security work.
+\`\`\`"
+    show_fix "Uninstall unused offensive tools (example)" \
+        "brew uninstall nmap" \
+        "# Or remove from /Applications"
+else
+    pass "No offensive tools detected"
+fi
+
+# Docker
+if daemon_loaded com.docker.vmnetd 2>/dev/null || daemon_loaded com.docker.socket 2>/dev/null; then
+    medium "Docker daemon daemons are installed (run as root)" \
+"Docker's vmnetd and socket daemon run as root-level LaunchDaemons. Containers can be used for privilege escalation.
+
+\`\`\`
+Fix: Only run Docker when actively needed. Consider lighter alternatives like Colima.
+\`\`\`"
+    show_fix "Consider lighter alternatives" \
+        "# Stop Docker Desktop when not in use" \
+        "# Consider Colima: brew install colima"
+else
+    pass "No Docker system daemons detected"
+fi
+
+# Siri voice trigger
+SIRI_VOICE=$(defaults read com.apple.Siri VoiceTriggerUserEnabled 2>/dev/null || echo "unknown")
+if [[ "$SIRI_VOICE" == "1" ]]; then
+    medium "'Hey Siri' voice trigger is enabled" \
+"Always-on microphone listening is a privacy concern.
+
+\`\`\`
+Fix: System Settings > Siri & Spotlight > Disable 'Listen for \"Hey Siri\"'
+\`\`\`"
+    show_fix "Disable Hey Siri voice trigger" \
+        "defaults write com.apple.Siri VoiceTriggerUserEnabled -bool false"
+elif [[ "$SIRI_VOICE" == "0" ]]; then
+    pass "'Hey Siri' voice trigger is disabled"
+fi
+
+###############################################################################
+# 15. BLUETOOTH DISCOVERABILITY
+###############################################################################
+printf "${CYAN}[15/${TOTAL_CHECKS}] Bluetooth Discoverability${NC}\n"
+
+BT_POWER=$(defaults read /Library/Preferences/com.apple.Bluetooth ControllerPowerState 2>/dev/null || echo "unknown")
+BT_DISCOVERABLE=$(defaults read /Library/Preferences/com.apple.Bluetooth BDAddr 2>/dev/null && \
+    system_profiler SPBluetoothDataType 2>/dev/null | grep -i "discoverable" | awk -F': ' '{print $2}' || echo "unknown")
+
+if [[ "$BT_POWER" == "0" ]]; then
+    pass "Bluetooth is OFF"
+elif [[ "$BT_POWER" == "1" ]]; then
+    # Check discoverability — on modern macOS, Bluetooth is discoverable when in System Settings > Bluetooth
+    BT_DISC_STATUS=$(system_profiler SPBluetoothDataType 2>/dev/null | awk -F': ' '/Discoverable/{print $2; exit}' || echo "unknown")
+    if [[ "$BT_DISC_STATUS" == "Yes" ]]; then
+        high "Bluetooth is ON and discoverable" \
+"Your Mac is visible to all nearby Bluetooth devices, which can be used for tracking and proximity attacks.
+
+\`\`\`
+Fix: System Settings > Bluetooth > Turn off when not in use
+     Or close the Bluetooth settings pane to stop discoverability
+\`\`\`"
+        show_fix "Turn off Bluetooth (if not needed)" \
+            "sudo defaults write /Library/Preferences/com.apple.Bluetooth ControllerPowerState -int 0" \
+            "sudo killall -HUP bluetoothd"
+    else
+        pass "Bluetooth is ON but not discoverable"
+    fi
+else
+    pass "Bluetooth status: could not determine (likely OFF)"
+fi
+
+###############################################################################
+# 16. LOCATION SERVICES
+###############################################################################
+printf "${CYAN}[16/${TOTAL_CHECKS}] Location Services${NC}\n"
+
+LOCATION_ENABLED=$(sudo -n defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || \
+    defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || \
+    launchctl list com.apple.locationd &>/dev/null && echo "running" || echo "unknown")
+
+if [[ "$LOCATION_ENABLED" == "1" || "$LOCATION_ENABLED" == "running" ]]; then
+    medium "Location Services are enabled globally" \
+"Location Services allow apps to access your physical location. Review which apps have access.
+
+\`\`\`
+Fix: System Settings > Privacy & Security > Location Services > review app access
+     Disable entirely if not needed: toggle off Location Services
+\`\`\`"
+    show_fix "Review Location Services settings" \
+        "Open System Settings > Privacy & Security > Location Services"
+elif [[ "$LOCATION_ENABLED" == "0" ]]; then
+    pass "Location Services are disabled"
+else
+    pass "Location Services: could not determine status (check manually)"
+fi
+
+###############################################################################
+# 17. ANALYTICS & TELEMETRY SHARING
+###############################################################################
+printf "${CYAN}[17/${TOTAL_CHECKS}] Analytics & Telemetry Sharing${NC}\n"
+
+ANALYTICS_ISSUES=""
+
+# Apple Analytics (Share Mac Analytics)
+SHARE_ANALYTICS=$(defaults read /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist AutoSubmit 2>/dev/null || echo "unknown")
+if [[ "$SHARE_ANALYTICS" == "1" ]]; then
+    ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Apple Analytics (Share Mac Analytics) is ON\n"
+fi
+
+# Share with App Developers
+SHARE_APP_DEV=$(defaults read /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist ThirdPartyDataSubmit 2>/dev/null || echo "unknown")
+if [[ "$SHARE_APP_DEV" == "1" ]]; then
+    ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Share with App Developers is ON\n"
+fi
+
+# Improve Siri & Dictation
+SIRI_DATA=$(defaults read com.apple.assistant.support "Siri Data Sharing Opt-In Status" 2>/dev/null || echo "unknown")
+if [[ "$SIRI_DATA" == "2" ]]; then
+    ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Improve Siri & Dictation is ON\n"
+fi
+
+if [[ -n "$ANALYTICS_ISSUES" ]]; then
+    medium "Analytics & telemetry sharing is enabled" \
+"The following telemetry sharing options are active:
+
+$(echo -e "$ANALYTICS_ISSUES")
+Data is sent to Apple (and potentially third-party developers), which may include usage patterns and diagnostic information.
+
+\`\`\`
+Fix: System Settings > Privacy & Security > Analytics & Improvements > disable all toggles
+\`\`\`"
+    show_fix "Disable analytics sharing" \
+        "defaults write '/Library/Application Support/CrashReporter/DiagnosticMessagesHistory.plist' AutoSubmit -bool false" \
+        "defaults write '/Library/Application Support/CrashReporter/DiagnosticMessagesHistory.plist' ThirdPartyDataSubmit -bool false" \
+        "defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 0"
+else
+    pass "Analytics & telemetry sharing appears disabled"
+fi
+
+###############################################################################
+# 18. USB RESTRICTED MODE
+###############################################################################
+printf "${CYAN}[18/${TOTAL_CHECKS}] USB Restricted Mode${NC}\n"
+
+USB_RESTRICTED=$(defaults read com.apple.security.smartcard allowSmartCard 2>/dev/null || echo "unknown")
+# On modern macOS, check the user defaults for accessory security
+ACCESSORY_SECURITY=$(defaults read /Library/Preferences/com.apple.security USBRestrictedMode 2>/dev/null || echo "unknown")
+
+# macOS Ventura+ has "Allow accessories to connect" under Lock Screen settings
+# The system_profiler or defaults may not expose this directly; check if feature is available
+if [[ "$ACCESSORY_SECURITY" == "0" ]]; then
+    high "USB Restricted Mode is DISABLED" \
+"USB accessories can connect even when your Mac is locked. This allows USB-based attacks (BadUSB, rubber ducky) without requiring unlock.
+
+\`\`\`
+Fix: System Settings > Privacy & Security > Allow accessories to connect > 'Ask for New Accessories'
+\`\`\`"
+    show_fix "Enable USB Restricted Mode" \
+        "Open System Settings > Privacy & Security > Allow accessories to connect > 'Ask for New Accessories'"
+else
+    pass "USB Restricted Mode: accessories require approval or device is unlocked"
+fi
+
+###############################################################################
+# 19. WI-FI AUTO-JOIN FOR OPEN NETWORKS
+###############################################################################
+printf "${CYAN}[19/${TOTAL_CHECKS}] Wi-Fi Auto-Join for Open Networks${NC}\n"
+
+# Check for auto-join on open/known networks
+# macOS stores Wi-Fi prefs in com.apple.wifi.known-networks (Sonoma+) or airport prefs
+AUTO_JOIN_OPEN=$(defaults read /Library/Preferences/com.apple.wifi.known-networks 2>/dev/null || echo "")
+WIFI_AUTOJOIN_HOTSPOT=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.wifi.known-networks 2>/dev/null || echo "")
+
+# Check the "auto join hotspot" and "ask to join" settings
+ASK_TO_JOIN=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.airport.preferences JoinModeFallback 2>/dev/null || \
+    defaults read com.apple.airport.preferences JoinModeFallback 2>/dev/null || echo "unknown")
+
+# "Prompt" is safe, "DoNothing" is safe, "JoinOpen" is insecure
+if [[ "$ASK_TO_JOIN" == "JoinOpen" ]]; then
+    high "Wi-Fi is set to auto-join open networks" \
+"Your Mac will automatically connect to any open (unencrypted) Wi-Fi network. This makes evil twin and MITM attacks trivial.
+
+\`\`\`
+Fix: System Settings > Wi-Fi > Ask to Join Networks > 'Ask'
+     Also: disable 'Auto-Join Hotspot' or set to 'Ask to Join'
+\`\`\`"
+    show_fix "Disable auto-join for open networks" \
+        "# System Settings > Wi-Fi > Ask to Join Networks > 'Ask'" \
+        "sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.airport.preferences JoinModeFallback -string 'Prompt'"
+else
+    pass "Wi-Fi auto-join for open networks: not enabled (or set to Ask)"
+fi
+
+###############################################################################
+# 20. TOUCH ID
+###############################################################################
+printf "${CYAN}[20/${TOTAL_CHECKS}] Touch ID${NC}\n"
+
+# Check if Touch ID hardware exists and is enrolled
+TOUCHID_HW=$(biometric -s 2>/dev/null || system_profiler SPiBridgeDataType 2>/dev/null | grep -i "fingerprint" || echo "")
+TOUCHID_ENROLLED=$(bioutil -c -s 2>/dev/null || echo "")
+
+if echo "$TOUCHID_ENROLLED" | grep -qi "fingerprints.*:.*[1-9]"; then
+    pass "Touch ID is enrolled with fingerprint(s)"
+elif echo "$TOUCHID_ENROLLED" | grep -qi "fingerprints.*:.*0\|no fingerprints\|not enrolled"; then
+    medium "Touch ID hardware present but no fingerprints enrolled" \
+"Touch ID adds a strong physical access control layer. Without it, only a password protects your session.
+
+\`\`\`
+Fix: System Settings > Touch ID & Password > Add a Fingerprint
+\`\`\`"
+    show_fix "Enroll a fingerprint in Touch ID" \
+        "Open System Settings > Touch ID & Password > Add a Fingerprint"
+elif [[ -n "$TOUCHID_HW" ]]; then
+    # Hardware exists but couldn't confirm enrollment
+    BIOUTIL_OUTPUT=$(bioutil -rs 2>/dev/null || echo "")
+    if echo "$BIOUTIL_OUTPUT" | grep -qi "count.*[1-9]\|user.*template"; then
+        pass "Touch ID is enrolled"
+    else
+        medium "Touch ID may not be enrolled — verify manually" \
+"Could not confirm fingerprint enrollment. Touch ID adds a strong physical access control layer.
+
+\`\`\`
+Fix: System Settings > Touch ID & Password > Add a Fingerprint
+\`\`\`"
+        show_fix "Enroll a fingerprint in Touch ID" \
+            "Open System Settings > Touch ID & Password > Add a Fingerprint"
+    fi
+else
+    pass "Touch ID: not available on this hardware (skipped)"
+fi
+
+###############################################################################
+# GENERATE REPORT
+###############################################################################
+echo ""
+printf "${CYAN}══════════════════════════════════════════════════════════${NC}\n"
+printf "${CYAN}  Generating report: %s${NC}\n" "$OUTPUT_FILE"
+printf "${CYAN}══════════════════════════════════════════════════════════${NC}\n"
+
+GRADE=$(letter_grade $SCORE)
+
+{
+cat <<EOF
+# macOS Security Audit Report
+
+**Machine:** ${HW_MODEL} (${HW_CHIP})
+**macOS:** ${OS_VERSION} (${OS_BUILD})
+**Serial:** ${SERIAL}
+**Date:** ${DATE_STAMP}
+**Overall Grade:** ${GRADE} (${SCORE}/100)
+
+---
+
+## PASS — Strong Foundations
+
+| Check | Status |
+|---|---|
+EOF
+
+for p in "${PASSES[@]}"; do
+    printf "| %s | PASS |\n" "$p"
+done
+
+if (( ${#CRITICALS[@]} > 0 )); then
+cat <<EOF
+
+---
+
+## CRITICAL — Fix Immediately
+
+EOF
+    idx=1
+    for c in "${CRITICALS[@]}"; do
+        printf "### %d. %s\n\n" "$idx" "$c"
+        echo ""
+        idx=$((idx + 1))
+    done
+fi
+
+if (( ${#HIGHS[@]} > 0 )); then
+cat <<EOF
+
+---
+
+## HIGH — Fix Soon
+
+EOF
+    idx=1
+    for h in "${HIGHS[@]}"; do
+        printf "### %d. %s\n\n" "$idx" "$h"
+        echo ""
+        idx=$((idx + 1))
+    done
+fi
+
+if (( ${#MEDIUMS[@]} > 0 )); then
+cat <<EOF
+
+---
+
+## MEDIUM — Recommended Hardening
+
+EOF
+    idx=1
+    for m in "${MEDIUMS[@]}"; do
+        printf "### %d. %s\n\n" "$idx" "$m"
+        echo ""
+        idx=$((idx + 1))
+    done
+fi
+
+cat <<EOF
+
+---
+
+## Summary
+
+| Severity | Count |
+|---|---|
+| PASS | ${#PASSES[@]} |
+| CRITICAL | ${#CRITICALS[@]} |
+| HIGH | ${#HIGHS[@]} |
+| MEDIUM | ${#MEDIUMS[@]} |
+| **Overall Grade** | **${GRADE}** (${SCORE}/100) |
+
+---
+
+*Generated by [macos-security-audit](https://github.com/fexxdev/macos-security-audit) v${VERSION} on ${DATE_STAMP}*
+EOF
+
+} > "$OUTPUT_FILE"
+
+echo ""
+printf "  ${GREEN}Report written to: %s${NC}\n" "$OUTPUT_FILE"
+echo ""
+printf "  Findings:  ${RED}%d critical${NC}  ${YELLOW}%d high${NC}  ${YELLOW}%d medium${NC}  ${GREEN}%d pass${NC}\n" \
+    "${#CRITICALS[@]}" "${#HIGHS[@]}" "${#MEDIUMS[@]}" "${#PASSES[@]}"
+printf "  Grade:     ${CYAN}%s${NC} (%d/100)\n" "$GRADE" "$SCORE"
+echo ""
+printf "  ${CYAN}Review the report:${NC} cat %s\n" "$OUTPUT_FILE"
+echo ""
