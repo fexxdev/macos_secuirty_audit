@@ -122,6 +122,19 @@ The audit produces:
 - **Terminal output** — colour-coded PASS/FAIL/WARN for each check
 - **Markdown report** — structured report with findings grouped by severity, suitable for sharing or diffing over time
 
+## Vibecoded & Transparent
+
+This project was built with AI assistance ("vibecoded"). Every line of code is open source and auditable. Here's what we do to make sure it's completely free of harm:
+
+- **Read-only by design** — the script only _reads_ system settings. It never changes, writes, or deletes anything on your machine unless you manually copy-paste a fix command yourself.
+- **No network calls** — nothing is phoned home, uploaded, or sent anywhere. The audit runs 100% locally.
+- **No dependencies** — pure Bash using only standard macOS system utilities (`defaults`, `csrutil`, `fdesetup`, `lsof`, etc.). No pip, no npm, no curl at runtime.
+- **Full source visibility** — the entire tool is a single shell script you can read end-to-end in minutes.
+- **Output stays local** — the Markdown report is written to your working directory. It never leaves your machine.
+- **Deterministic** — same system state → same report. No random behaviour, no telemetry, no analytics.
+
+If you find anything concerning, please open an issue. We take this seriously.
+
 ## License
 
 MIT

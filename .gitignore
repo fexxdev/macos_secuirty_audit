@@ -1,0 +1,11 @@
+# Generated audit reports (contain machine-specific sensitive info)
+security-audit-*.md
+bin/security-audit-*.md
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~

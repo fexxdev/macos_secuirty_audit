@@ -140,6 +140,65 @@ letter_grade() {
 cmd_exists()  { command -v "$1" &>/dev/null; }
 daemon_loaded() { launchctl list "$1" &>/dev/null; }
 
+# ── Spinner ──────────────────────────────────────────────────────────
+SPINNER_PID=""
+SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+
+spin_start() {
+    local msg="$1"
+    (
+        i=0
+        while true; do
+            printf "\r  ${CYAN}%s${NC} %s  " "${SPINNER_FRAMES[$((i % ${#SPINNER_FRAMES[@]}))]}" "$msg"
+            sleep 0.08
+            i=$((i + 1))
+        done
+    ) &
+    SPINNER_PID=$!
+    # Ensure spinner is killed on script exit
+    trap 'kill $SPINNER_PID 2>/dev/null' EXIT
+}
+
+spin_stop() {
+    if [[ -n "$SPINNER_PID" ]]; then
+        kill "$SPINNER_PID" 2>/dev/null
+        wait "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
+        printf "\r\033[K"  # clear the spinner line
+    fi
+}
+
+# Wrapper: print check header with spinner, run check, stop spinner
+check_header() {
+    local num="$1" title="$2"
+    spin_stop
+    printf "${CYAN}[%s/${TOTAL_CHECKS}] %s${NC}\n" "$num" "$title"
+}
+
+# ── Known-good LaunchAgent whitelist ─────────────────────────────────
+# Common legitimate agents that don't need to be flagged.
+# Add entries as plain plist filenames (one per line).
+KNOWN_AGENTS=(
+    "com.google.GoogleUpdater.wake.plist"
+    "com.google.keystone.agent.plist"
+    "com.google.keystone.xpcservice.plist"
+    "com.jetbrains.AppCode.BridgeService.plist"
+    "com.lwouis.alt-tab-macos.plist"
+    "com.privateinternetaccess.vpn.client.plist"
+    "com.valvesoftware.steamclean.plist"
+    "homebrew.mxcl.nginx.plist"
+    "org.keepassxc.KeePassXC.plist"
+    "com.github.facebook.watchman.plist"
+)
+
+is_known_agent() {
+    local name="$1"
+    for known in "${KNOWN_AGENTS[@]}"; do
+        [[ "$name" == "$known" ]] && return 0
+    done
+    return 1
+}
+
 # ── Header ───────────────────────────────────────────────────────────
 echo ""
 printf "${CYAN}╔══════════════════════════════════════════════════════╗${NC}\n"
@@ -158,10 +217,12 @@ printf "  macOS   : %s (%s)\n" "$OS_VERSION" "$OS_BUILD"
 printf "  Serial  : %s\n" "$SERIAL"
 echo ""
 
+spin_start "Running security checks…"
+
 ###############################################################################
 # 1. DISK ENCRYPTION
 ###############################################################################
-printf "${CYAN}[1/${TOTAL_CHECKS}] Disk Encryption (FileVault)${NC}\n"
+check_header 1 "Disk Encryption (FileVault)"
 if fdesetup status 2>/dev/null | grep -q "On"; then
     pass "FileVault is ON"
 else
@@ -178,7 +239,7 @@ fi
 ###############################################################################
 # 2. SYSTEM INTEGRITY PROTECTION
 ###############################################################################
-printf "${CYAN}[2/${TOTAL_CHECKS}] System Integrity Protection (SIP)${NC}\n"
+check_header 2 "System Integrity Protection (SIP)"
 if csrutil status 2>/dev/null | grep -q "enabled"; then
     pass "SIP is enabled"
 else
@@ -197,7 +258,7 @@ fi
 ###############################################################################
 # 3. GATEKEEPER & SECURE BOOT
 ###############################################################################
-printf "${CYAN}[3/${TOTAL_CHECKS}] Gatekeeper & Secure Boot${NC}\n"
+check_header 3 "Gatekeeper & Secure Boot"
 if spctl --status 2>&1 | grep -q "enabled"; then
     pass "Gatekeeper is enabled"
 else
@@ -228,7 +289,7 @@ fi
 ###############################################################################
 # 4. FIREWALL
 ###############################################################################
-printf "${CYAN}[4/${TOTAL_CHECKS}] Firewall${NC}\n"
+check_header 4 "Firewall"
 FW_BIN="/usr/libexec/ApplicationFirewall/socketfilterfw"
 if "$FW_BIN" --getglobalstate 2>/dev/null | grep -q "enabled"; then
     pass "Firewall is enabled"
@@ -259,7 +320,7 @@ fi
 ###############################################################################
 # 5. LOCKDOWN MODE
 ###############################################################################
-printf "${CYAN}[5/${TOTAL_CHECKS}] Lockdown Mode${NC}\n"
+check_header 5 "Lockdown Mode"
 LDM_ENABLED=false
 if defaults read /Library/Managed\ Preferences/.GlobalPreferences LDMGlobalEnabled 2>/dev/null | grep -q "1"; then
     LDM_ENABLED=true
@@ -286,7 +347,7 @@ fi
 ###############################################################################
 # 6. SOFTWARE UPDATES
 ###############################################################################
-printf "${CYAN}[6/${TOTAL_CHECKS}] Software Updates${NC}\n"
+check_header 6 "Software Updates"
 # On macOS 26+ AutomaticCheckEnabled is absent when updates are on.
 # Check the keys that ARE present: AutomaticDownload, CriticalUpdateInstall,
 # AutomaticallyInstallMacOSUpdates, ConfigDataInstall.
@@ -338,7 +399,7 @@ fi
 ###############################################################################
 # 7. NETWORK EXPOSURE
 ###############################################################################
-printf "${CYAN}[7/${TOTAL_CHECKS}] Network Exposure${NC}\n"
+check_header 7 "Network Exposure"
 
 # Open listening ports on all interfaces (excluding localhost)
 OPEN_PORTS=$(lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null | grep -v "127.0.0.1\|::1" | tail -n +2 || true)
@@ -356,6 +417,8 @@ Fix: Bind services to 127.0.0.1 (localhost) or stop them if not needed.
      For nginx: change 'listen 8080' to 'listen 127.0.0.1:8080' in nginx.conf
      To stop nginx: brew services stop nginx
 \`\`\`"
+    # Print the list to terminal so user can see which services are exposed
+    echo "$PORT_LIST"
     show_fix "Stop exposed services (examples)" \
         "brew services stop nginx" \
         "# Or bind to localhost in service configuration"
@@ -382,7 +445,7 @@ fi
 ###############################################################################
 # 8. SHARING SERVICES
 ###############################################################################
-printf "${CYAN}[8/${TOTAL_CHECKS}] Sharing Services${NC}\n"
+check_header 8 "Sharing Services"
 
 # AirDrop
 AIRDROP_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "unknown")
@@ -463,7 +526,7 @@ fi
 ###############################################################################
 # 9. USER ACCOUNTS & AUTHENTICATION
 ###############################################################################
-printf "${CYAN}[9/${TOTAL_CHECKS}] User Accounts & Authentication${NC}\n"
+check_header 9 "User Accounts & Authentication"
 
 # Auto-login
 if defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser &>/dev/null; then
@@ -556,7 +619,7 @@ fi
 ###############################################################################
 # 10. SSH CONFIGURATION
 ###############################################################################
-printf "${CYAN}[10/${TOTAL_CHECKS}] SSH Configuration${NC}\n"
+check_header 10 "SSH Configuration"
 
 AUTH_KEYS="$HOME/.ssh/authorized_keys"
 if [[ -f "$AUTH_KEYS" ]] && [[ -s "$AUTH_KEYS" ]]; then
@@ -589,7 +652,7 @@ fi
 ###############################################################################
 # 11. PERSISTENCE MECHANISMS
 ###############################################################################
-printf "${CYAN}[11/${TOTAL_CHECKS}] Persistence Mechanisms${NC}\n"
+check_header 11 "Persistence Mechanisms"
 
 # Third-party LaunchDaemons (run as root)
 THIRD_PARTY_DAEMONS=$(ls /Library/LaunchDaemons/ 2>/dev/null | grep -v '^com.apple' || true)
@@ -625,17 +688,8 @@ rm -rf ~/Library/Logs/TeamViewer
 \`\`\`
 ls /Library/LaunchDaemons/com.teamviewer* 2>/dev/null && echo 'STILL PRESENT' || echo 'Clean'
 \`\`\`"
-        show_fix "Uninstall TeamViewer" \
-            "sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.Helper.plist" \
-            "sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.UninstallerHelper.plist" \
-            "sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.UninstallerWatcher.plist" \
-            "sudo rm /Library/LaunchDaemons/com.teamviewer.*" \
-            "sudo rm /Library/PrivilegedHelperTools/com.teamviewer.Helper" \
-            "sudo rm -rf '/Library/Application Support/TeamViewer'" \
-            "rm -rf ~/Library/Application\\ Support/TeamViewer" \
-            "rm -rf ~/Library/Caches/com.teamviewer.*" \
-            "rm -rf ~/Library/Preferences/com.teamviewer*" \
-            "rm -rf ~/Library/Logs/TeamViewer"
+        show_fix "Uninstall TeamViewer (run this single block)" \
+            "osascript -e 'quit app \"TeamViewer\"' 2>/dev/null; sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.*.plist 2>/dev/null; sudo rm -f /Library/LaunchDaemons/com.teamviewer.* && sudo rm -f /Library/PrivilegedHelperTools/com.teamviewer.Helper && sudo rm -rf '/Library/Application Support/TeamViewer' && sudo rm -rf /Applications/TeamViewer.app && rm -rf ~/Library/Application\\ Support/TeamViewer ~/Library/Caches/com.teamviewer.* ~/Library/Preferences/com.teamviewer* ~/Library/Logs/TeamViewer; echo 'TeamViewer removed.'"
     else
         medium "Third-party LaunchDaemons found (run as root)" \
 "Review these for legitimacy — any of them could be a persistence backdoor:
@@ -660,20 +714,36 @@ USER_AGENTS=$(ls ~/Library/LaunchAgents/ 2>/dev/null || true)
 if [[ -n "$USER_AGENTS" ]]; then
     AGENT_COUNT=$(echo "$USER_AGENTS" | wc -l | tr -d ' ')
     AGENT_LIST=$(echo "$USER_AGENTS" | sed 's/^/  - /')
-    if (( AGENT_COUNT > 5 )); then
-        medium "$AGENT_COUNT user LaunchAgents found — review for legitimacy" \
-"$AGENT_LIST
+
+    # Filter out known-good agents
+    UNKNOWN_AGENTS=""
+    while IFS= read -r agent; do
+        [[ -z "$agent" ]] && continue
+        if ! is_known_agent "$agent"; then
+            UNKNOWN_AGENTS+="  - ${agent}\n"
+        fi
+    done <<< "$USER_AGENTS"
+    UNKNOWN_COUNT=$(echo -e "$UNKNOWN_AGENTS" | grep -c '^ ' || true)
+
+    if (( UNKNOWN_COUNT > 0 )); then
+        medium "$UNKNOWN_COUNT unknown user LaunchAgent(s) found (${AGENT_COUNT} total) — review for legitimacy" \
+"Unknown agents (not in whitelist):
+$(echo -e "$UNKNOWN_AGENTS")
+All agents:
+$AGENT_LIST
 
 \`\`\`
 Fix: Review each one. Remove unneeded agents:
      launchctl unload ~/Library/LaunchAgents/<plist>
      rm ~/Library/LaunchAgents/<plist>
 \`\`\`"
+        # Print unknown agents to terminal
+        echo -e "$UNKNOWN_AGENTS"
         show_fix "Remove unwanted LaunchAgents (example)" \
             "launchctl unload ~/Library/LaunchAgents/<plist-name>" \
             "rm ~/Library/LaunchAgents/<plist-name>"
     else
-        pass "$AGENT_COUNT user LaunchAgents (review periodically)"
+        pass "$AGENT_COUNT user LaunchAgents (all known/whitelisted)"
     fi
 else
     pass "No user LaunchAgents"
@@ -699,7 +769,7 @@ fi
 ###############################################################################
 # 12. DNS & NETWORK CONFIGURATION
 ###############################################################################
-printf "${CYAN}[12/${TOTAL_CHECKS}] DNS & Network${NC}\n"
+check_header 12 "DNS & Network"
 
 DNS_SERVERS=$(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/{print $3}' | head -2 | sort -u | tr '\n' ', ' | sed 's/,$//')
 KNOWN_GOOD="1.1.1.1|1.0.0.1|8.8.8.8|8.8.4.4|9.9.9.9|149.112.112.112"
@@ -766,7 +836,7 @@ fi
 ###############################################################################
 # 13. CERTIFICATES & TRUST STORE
 ###############################################################################
-printf "${CYAN}[13/${TOTAL_CHECKS}] Certificates & Trust Store${NC}\n"
+check_header 13 "Certificates & Trust Store"
 
 # mkcert local CA
 MKCERT_ROOT=""
@@ -801,7 +871,7 @@ fi
 ###############################################################################
 # 14. INSTALLED SOFTWARE REVIEW
 ###############################################################################
-printf "${CYAN}[14/${TOTAL_CHECKS}] Installed Software Review${NC}\n"
+check_header 14 "Installed Software Review"
 
 # Offensive / dual-use tools
 OFFENSIVE_TOOLS=""
@@ -825,6 +895,8 @@ $(echo -e "$OFFENSIVE_TOOLS")
 \`\`\`
 Fix: Uninstall any you're not actively using. Keep them in a VM if needed for security work.
 \`\`\`"
+    # Print the tools list to terminal
+    echo -e "$OFFENSIVE_TOOLS"
     show_fix "Uninstall unused offensive tools (example)" \
         "brew uninstall nmap" \
         "# Or remove from /Applications"
@@ -865,18 +937,25 @@ fi
 ###############################################################################
 # 15. BLUETOOTH DISCOVERABILITY
 ###############################################################################
-printf "${CYAN}[15/${TOTAL_CHECKS}] Bluetooth Discoverability${NC}\n"
+check_header 15 "Bluetooth Discoverability"
 
-BT_POWER=$(defaults read /Library/Preferences/com.apple.Bluetooth ControllerPowerState 2>/dev/null || echo "unknown")
-BT_DISCOVERABLE=$(defaults read /Library/Preferences/com.apple.Bluetooth BDAddr 2>/dev/null && \
-    system_profiler SPBluetoothDataType 2>/dev/null | grep -i "discoverable" | awk -F': ' '{print $2}' || echo "unknown")
+# Primary: system_profiler is the most reliable source on modern macOS
+BT_INFO=$(system_profiler SPBluetoothDataType 2>/dev/null || true)
+BT_POWER="unknown"
+if echo "$BT_INFO" | grep -qi "State:.*On\|Power:.*On\|Bluetooth.*On"; then
+    BT_POWER="1"
+elif echo "$BT_INFO" | grep -qi "State:.*Off\|Power:.*Off\|Bluetooth.*Off"; then
+    BT_POWER="0"
+else
+    # Fallback: defaults
+    BT_POWER=$(defaults read /Library/Preferences/com.apple.Bluetooth ControllerPowerState 2>/dev/null || echo "unknown")
+fi
 
 if [[ "$BT_POWER" == "0" ]]; then
     pass "Bluetooth is OFF"
 elif [[ "$BT_POWER" == "1" ]]; then
-    # Check discoverability — on modern macOS, Bluetooth is discoverable when in System Settings > Bluetooth
-    BT_DISC_STATUS=$(system_profiler SPBluetoothDataType 2>/dev/null | awk -F': ' '/Discoverable/{print $2; exit}' || echo "unknown")
-    if [[ "$BT_DISC_STATUS" == "Yes" ]]; then
+    BT_DISC_STATUS=$(echo "$BT_INFO" | awk -F': ' '/Discoverable/{print $2; exit}' || echo "unknown")
+    if [[ "$BT_DISC_STATUS" == *"Yes"* ]]; then
         high "Bluetooth is ON and discoverable" \
 "Your Mac is visible to all nearby Bluetooth devices, which can be used for tracking and proximity attacks.
 
@@ -891,19 +970,39 @@ Fix: System Settings > Bluetooth > Turn off when not in use
         pass "Bluetooth is ON but not discoverable"
     fi
 else
-    pass "Bluetooth status: could not determine (likely OFF)"
+    # Could not read state — check if bluetoothd is running at all
+    if pgrep -q bluetoothd 2>/dev/null; then
+        pass "Bluetooth daemon is running (state unclear — verify in System Settings)"
+    else
+        pass "Bluetooth appears OFF (daemon not running)"
+    fi
 fi
 
 ###############################################################################
 # 16. LOCATION SERVICES
 ###############################################################################
-printf "${CYAN}[16/${TOTAL_CHECKS}] Location Services${NC}\n"
+check_header 16 "Location Services"
 
-LOCATION_ENABLED=$(sudo -n defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || \
-    defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || \
-    launchctl list com.apple.locationd &>/dev/null && echo "running" || echo "unknown")
+# Try multiple methods to determine Location Services status
+LOCATION_ENABLED="unknown"
+# Method 1: Direct read (requires sudo or prior auth)
+LOCATION_ENABLED=$(sudo -n defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || echo "unknown")
+# Method 2: Check via the locationd plist without sudo (some systems allow this)
+if [[ "$LOCATION_ENABLED" == "unknown" ]]; then
+    LOCATION_ENABLED=$(defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || echo "unknown")
+fi
+# Method 3: Check if locationd daemon is loaded and actively servicing clients
+if [[ "$LOCATION_ENABLED" == "unknown" ]]; then
+    if launchctl list com.apple.locationd &>/dev/null; then
+        # Daemon is loaded — on modern macOS this means Location Services are enabled
+        # (the daemon is not loaded when Location Services are fully off)
+        LOCATION_ENABLED="1"
+    else
+        LOCATION_ENABLED="0"
+    fi
+fi
 
-if [[ "$LOCATION_ENABLED" == "1" || "$LOCATION_ENABLED" == "running" ]]; then
+if [[ "$LOCATION_ENABLED" == "1" ]]; then
     medium "Location Services are enabled globally" \
 "Location Services allow apps to access your physical location. Review which apps have access.
 
@@ -922,7 +1021,7 @@ fi
 ###############################################################################
 # 17. ANALYTICS & TELEMETRY SHARING
 ###############################################################################
-printf "${CYAN}[17/${TOTAL_CHECKS}] Analytics & Telemetry Sharing${NC}\n"
+check_header 17 "Analytics & Telemetry Sharing"
 
 ANALYTICS_ISSUES=""
 
@@ -965,7 +1064,7 @@ fi
 ###############################################################################
 # 18. USB RESTRICTED MODE
 ###############################################################################
-printf "${CYAN}[18/${TOTAL_CHECKS}] USB Restricted Mode${NC}\n"
+check_header 18 "USB Restricted Mode"
 
 USB_RESTRICTED=$(defaults read com.apple.security.smartcard allowSmartCard 2>/dev/null || echo "unknown")
 # On modern macOS, check the user defaults for accessory security
@@ -989,7 +1088,7 @@ fi
 ###############################################################################
 # 19. WI-FI AUTO-JOIN FOR OPEN NETWORKS
 ###############################################################################
-printf "${CYAN}[19/${TOTAL_CHECKS}] Wi-Fi Auto-Join for Open Networks${NC}\n"
+check_header 19 "Wi-Fi Auto-Join for Open Networks"
 
 # Check for auto-join on open/known networks
 # macOS stores Wi-Fi prefs in com.apple.wifi.known-networks (Sonoma+) or airport prefs
@@ -1019,7 +1118,7 @@ fi
 ###############################################################################
 # 20. TOUCH ID
 ###############################################################################
-printf "${CYAN}[20/${TOTAL_CHECKS}] Touch ID${NC}\n"
+check_header 20 "Touch ID"
 
 # Check if Touch ID hardware exists and is enrolled
 TOUCHID_HW=$(biometric -s 2>/dev/null || system_profiler SPiBridgeDataType 2>/dev/null | grep -i "fingerprint" || echo "")
@@ -1058,6 +1157,7 @@ fi
 ###############################################################################
 # GENERATE REPORT
 ###############################################################################
+spin_stop
 echo ""
 printf "${CYAN}══════════════════════════════════════════════════════════${NC}\n"
 printf "${CYAN}  Generating report: %s${NC}\n" "$OUTPUT_FILE"
