@@ -23,8 +23,8 @@
 
 set -euo pipefail
 
-VERSION="2.0.0"
-TOTAL_CHECKS=36
+VERSION="2.1.0"
+TOTAL_CHECKS=42
 
 # ── Colours / symbols for terminal output ────────────────────────────
 if [[ -t 1 ]]; then
@@ -80,6 +80,12 @@ list_checks() {
     printf " %-4s %-14s %s\n" "34" "software"   "Safari Safe File Auto-Open"
     printf " %-4s %-14s %s\n" "35" "software"   "Secure Keyboard Entry (Terminal)"
     printf " %-4s %-14s %s\n" "36" "software"   "Docker Daemons"
+    printf " %-4s %-14s %s\n" "37" "encryption" "FileVault Recovery Key"
+    printf " %-4s %-14s %s\n" "38" "system"     "Configuration Profiles"
+    printf " %-4s %-14s %s\n" "39" "system"     "MRT / XProtect Remediator"
+    printf " %-4s %-14s %s\n" "40" "auth"       "Password Policy"
+    printf " %-4s %-14s %s\n" "41" "privacy"    "Privacy Permissions (TCC)"
+    printf " %-4s %-14s %s\n" "42" "software"   "Safari Privacy & Security"
 }
 
 # ── Usage ─────────────────────────────────────────────────────────────
@@ -112,11 +118,12 @@ EXAMPLES:
     macos-security-audit --quiet
     macos-security-audit --list-checks
 
-CHECKS PERFORMED (36):
+CHECKS PERFORMED (42):
 
   Encryption:
      1  Disk Encryption (FileVault)
      2  Time Machine Backup & Encryption
+    37  FileVault Recovery Key
 
   System:
      3  System Integrity Protection (SIP)
@@ -126,6 +133,8 @@ CHECKS PERFORMED (36):
      7  XProtect Definitions
      8  Kernel Extensions
      9  Find My Mac
+    38  Configuration Profiles
+    39  MRT / XProtect Remediator
 
   Network:
     10  Firewall & Stealth Mode
@@ -150,12 +159,14 @@ CHECKS PERFORMED (36):
     25  Login Window Configuration
     26  Touch ID
     27  USB Restricted Mode
+    40  Password Policy
 
   Privacy:
     28  Location Services
     29  Analytics & Telemetry Sharing
     30  Bluetooth Discoverability
     31  Siri Voice Trigger
+    41  Privacy Permissions (TCC)
 
   Software:
     32  Software Updates
@@ -163,6 +174,7 @@ CHECKS PERFORMED (36):
     34  Safari Safe File Auto-Open
     35  Secure Keyboard Entry (Terminal)
     36  Docker Daemons
+    42  Safari Privacy & Security
 EOF
     exit 0
 }
@@ -225,13 +237,13 @@ show_fix() {
 # ── Category filtering ──────────────────────────────────────────────
 check_category() {
     case $1 in
-        1|2) echo "encryption" ;;
-        3|4|5|6|7|8|9) echo "system" ;;
+        1|2|37) echo "encryption" ;;
+        3|4|5|6|7|8|9|38|39) echo "system" ;;
         10|11|12|13|14|15) echo "network" ;;
         16|17|18|19|20|21) echo "sharing" ;;
-        22|23|24|25|26|27) echo "auth" ;;
-        28|29|30|31) echo "privacy" ;;
-        32|33|34|35|36) echo "software" ;;
+        22|23|24|25|26|27|40) echo "auth" ;;
+        28|29|30|31|41) echo "privacy" ;;
+        32|33|34|35|36|42) echo "software" ;;
         *) echo "unknown" ;;
     esac
 }
@@ -439,6 +451,19 @@ KNOWN_AGENTS=(
     "homebrew.mxcl.nginx.plist"
     "org.keepassxc.KeePassXC.plist"
     "com.github.facebook.watchman.plist"
+    "com.1password.1password-launcher.plist"
+    "com.raycast.macos.RaycastLauncher.plist"
+    "com.spotify.client.startuphelper.plist"
+    "com.dropbox.DropboxMacUpdate.agent.plist"
+    "com.microsoft.update.agent.plist"
+    "com.adobe.AdobeCreativeCloud.plist"
+    "com.docker.helper.plist"
+    "com.nordvpn.osx.helper.plist"
+    "com.objective-see.lulu.plist"
+    "com.malwarebytes.mbam.frontend.agent.plist"
+    "com.grammarly.ProjectLlama.plist"
+    "org.mozilla.firefoxupdater.plist"
+    "com.brave.Browser.UpdaterPrivilegedHelper.plist"
 )
 
 is_known_agent() {
@@ -637,7 +662,10 @@ check_system_xprotect() {
 
     if [[ -n "$last_xp_update" ]]; then
         local update_epoch
-        update_epoch=$(date -j -f "%m/%d/%y, %I:%M %p" "$last_xp_update" "+%s" 2>/dev/null || \
+        update_epoch=$(date -j -f "%Y-%m-%d, %H:%M:%S" "$last_xp_update" "+%s" 2>/dev/null || \
+                       date -j -f "%m/%d/%y, %I:%M %p" "$last_xp_update" "+%s" 2>/dev/null || \
+                       date -j -f "%d/%m/%y, %I:%M %p" "$last_xp_update" "+%s" 2>/dev/null || \
+                       date -j -f "%d/%m/%Y, %H:%M" "$last_xp_update" "+%s" 2>/dev/null || \
                        date -j -f "%Y-%m-%d" "$last_xp_update" "+%s" 2>/dev/null || echo "0")
         local now_epoch
         now_epoch=$(date "+%s")
@@ -773,7 +801,7 @@ check_network_exposure() {
     OPEN_PORTS=$(lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null | grep -v "127.0.0.1\|::1" | tail -n +2 || true)
 
     if [[ -n "$OPEN_PORTS" ]]; then
-        PORT_LIST=$(echo "$OPEN_PORTS" | awk '{printf "  - %s (PID %s) on %s\n", $1, $2, $9}' | sort -u)
+        PORT_LIST=$(echo "$OPEN_PORTS" | awk '{printf "  - %s (PID %s) on %s\n", $1, $2, $(NF-1)}' | sort -u)
         high "Services listening on all network interfaces" \
 "The following services are reachable by anyone on your local network:
 
@@ -1364,7 +1392,7 @@ check_auth_login_window() {
 
     local hints
     hints=$(defaults read /Library/Preferences/com.apple.loginwindow RetriesUntilHint 2>/dev/null || echo "unknown")
-    if [[ "$hints" != "0" ]] && [[ "$hints" != "unknown" ]]; then
+    if [[ "$hints" =~ ^[0-9]+$ ]] && (( hints > 0 )); then
         issues="${issues}  - Password hints shown after ${hints} failed attempt(s)\n"
     fi
 
@@ -1899,6 +1927,264 @@ Fix: Only run Docker when actively needed. Consider lighter alternatives like Co
 }
 
 ###############################################################################
+# CHECKS — Additional Encryption
+###############################################################################
+
+check_encryption_recovery_key() {
+    local n=$1
+    if ! should_run_check "$n"; then return; fi
+    check_header "$n" "FileVault Recovery Key"
+
+    if ! fdesetup status 2>/dev/null | grep -q "On"; then
+        pass "FileVault is off (recovery key check not applicable)"
+        return
+    fi
+
+    local has_personal has_institutional
+    has_personal=$(fdesetup haspersonalrecoverykey 2>/dev/null || echo "unknown")
+    has_institutional=$(fdesetup hasinstitutionalrecoverykey 2>/dev/null || echo "unknown")
+
+    if echo "$has_personal" | grep -qi "true"; then
+        pass "FileVault personal recovery key exists"
+    elif echo "$has_institutional" | grep -qi "true"; then
+        pass "FileVault institutional recovery key exists"
+    else
+        high "No FileVault recovery key found" \
+"Without a recovery key, if you forget your password you will permanently lose access to all data on this Mac.
+
+\`\`\`
+Fix: sudo fdesetup changerecovery -personal
+     Store the recovery key in a secure location (password manager, safe, etc.)
+\`\`\`"
+        show_fix "Create a FileVault recovery key" \
+            "sudo fdesetup changerecovery -personal"
+        _record_high_json "No FileVault recovery key found" "Without a recovery key, if you forget your password you will permanently lose access to all data."
+    fi
+}
+
+###############################################################################
+# CHECKS — Additional System
+###############################################################################
+
+check_system_profiles() {
+    local n=$1
+    if ! should_run_check "$n"; then return; fi
+    check_header "$n" "Configuration Profiles"
+
+    local mdm_status
+    mdm_status=$(profiles status -type enrollment 2>&1 || echo "")
+
+    if echo "$mdm_status" | grep -qi "MDM enrollment.*Yes"; then
+        medium "Device is enrolled in MDM (Mobile Device Management)" \
+"An MDM server can remotely manage settings, install profiles, and enforce policies on this Mac. Verify this is expected.
+
+\`\`\`
+Fix: If unexpected on a personal device:
+     System Settings > General > Device Management > Remove MDM profile
+     Note: DEP/ADE enrolled devices may require a full wipe to remove MDM
+\`\`\`"
+        show_fix "Review MDM enrollment" \
+            "profiles status -type enrollment"
+        _record_medium_json "Device is enrolled in MDM" "An MDM server can remotely manage settings on this Mac."
+    else
+        pass "Device is not enrolled in MDM"
+    fi
+
+    local user_profiles
+    user_profiles=$(profiles list 2>&1 || echo "")
+
+    if echo "$user_profiles" | grep -qi "no configuration profiles installed\|no profiles\|returned 0 records"; then
+        pass "No configuration profiles installed"
+    elif echo "$user_profiles" | grep -qi "error\|unable\|not allowed"; then
+        pass "Configuration profiles: could not query (check manually)"
+    elif [[ -n "$user_profiles" ]]; then
+        medium "Configuration profiles installed — review for legitimacy" \
+"Installed configuration profiles can modify system settings, enforce restrictions, or route network traffic through third-party servers. Malicious profiles can enable surveillance.
+
+\`\`\`
+Fix: System Settings > General > Device Management > review each profile
+     profiles list   # to see all installed profiles
+\`\`\`"
+        show_fix "Review configuration profiles" \
+            "profiles list"
+        _record_medium_json "Configuration profiles installed" "Review installed configuration profiles for legitimacy."
+    else
+        pass "No configuration profiles installed"
+    fi
+}
+
+check_system_mrt() {
+    local n=$1
+    if ! should_run_check "$n"; then return; fi
+    check_header "$n" "MRT / XProtect Remediator"
+
+    local found=false
+
+    # XProtect Remediator (macOS Ventura+) supersedes MRT
+    local xpr_path="/Library/Apple/System/Library/CoreServices/XProtect.app"
+    if [[ -d "$xpr_path" ]]; then
+        local xpr_version
+        xpr_version=$(defaults read "$xpr_path/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "unknown")
+        pass "XProtect Remediator installed (version: ${xpr_version})"
+        found=true
+    fi
+
+    # MRT (legacy, pre-Ventura)
+    local mrt_path="/Library/Apple/System/Library/CoreServices/MRT.app"
+    if [[ -d "$mrt_path" ]]; then
+        local mrt_version
+        mrt_version=$(defaults read "$mrt_path/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo "unknown")
+        pass "MRT installed (version: ${mrt_version})"
+        found=true
+    fi
+
+    if ! $found; then
+        medium "Neither MRT nor XProtect Remediator found" \
+"These are macOS's background malware removal tools. At least one should be present on any supported Mac.
+
+\`\`\`
+Fix: System Settings > General > Software Update > check for updates
+     sudo softwareupdate --background-critical
+\`\`\`"
+        show_fix "Check for system updates" \
+            "sudo softwareupdate --background-critical"
+        _record_medium_json "Neither MRT nor XProtect Remediator found" "macOS malware removal tools should be installed automatically."
+    fi
+}
+
+###############################################################################
+# CHECKS — Additional Auth
+###############################################################################
+
+check_auth_password_policy() {
+    local n=$1
+    if ! should_run_check "$n"; then return; fi
+    check_header "$n" "Password Policy"
+
+    local policy_xml
+    policy_xml=$(pwpolicy getaccountpolicies 2>/dev/null || echo "")
+
+    if [[ -z "$policy_xml" ]] || echo "$policy_xml" | grep -qi "no account policies" || ! echo "$policy_xml" | grep -q "policyContent"; then
+        medium "No custom password policy configured" \
+"macOS defaults allow any password length and complexity. Without a policy, weak passwords like '1234' are accepted.
+
+\`\`\`
+Fix: For personal use: set a strong password (12+ characters, mixed types)
+     System Settings > Touch ID & Password > Change Password
+     For enterprise: use an MDM solution to enforce password policies
+\`\`\`"
+        show_fix "Set a strong password" \
+            "# System Settings > Touch ID & Password > Change Password" \
+            "# Recommend: 12+ characters with uppercase, lowercase, numbers, symbols"
+        _record_medium_json "No custom password policy configured" "macOS defaults allow any password length and complexity."
+    else
+        pass "Password policy is configured"
+    fi
+}
+
+###############################################################################
+# CHECKS — Additional Privacy
+###############################################################################
+
+check_privacy_tcc() {
+    local n=$1
+    if ! should_run_check "$n"; then return; fi
+    check_header "$n" "Privacy Permissions (TCC)"
+
+    local tcc_db="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+    local issues=""
+    local tcc_readable=false
+
+    if [[ -f "$tcc_db" ]]; then
+        # Test if we can actually read the database
+        if sqlite3 "$tcc_db" "SELECT COUNT(*) FROM access LIMIT 1;" &>/dev/null; then
+            tcc_readable=true
+            local sensitive_services=("kTCCServiceCamera" "kTCCServiceMicrophone" "kTCCServiceScreenCapture" "kTCCServiceAccessibility" "kTCCServiceSystemPolicyAllFiles")
+            local friendly_names=("Camera" "Microphone" "Screen Recording" "Accessibility" "Full Disk Access")
+
+            for i in "${!sensitive_services[@]}"; do
+                local service="${sensitive_services[$i]}"
+                local friendly="${friendly_names[$i]}"
+                local count
+                count=$(sqlite3 "$tcc_db" "SELECT COUNT(*) FROM access WHERE service='$service' AND allowed=1;" 2>/dev/null || echo "0")
+                if [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 )); then
+                    issues="${issues}  - ${friendly}: ${count} app(s) granted access\n"
+                fi
+            done
+        fi
+    fi
+
+    if [[ -n "$issues" ]]; then
+        medium "Sensitive privacy permissions granted to apps" \
+"The following high-risk privacy permissions are active:
+
+$(echo -e "$issues")
+Review whether each app legitimately needs these permissions.
+
+\`\`\`
+Fix: System Settings > Privacy & Security > review each category
+     Revoke access for apps that no longer need it
+\`\`\`"
+        show_fix "Review privacy permissions" \
+            "Open System Settings > Privacy & Security > review Camera, Microphone, Screen Recording, Accessibility, Full Disk Access"
+        _record_medium_json "Sensitive privacy permissions granted to apps" "Review high-risk privacy permissions."
+    elif $tcc_readable; then
+        pass "No sensitive privacy permission grants detected"
+    else
+        pass "Privacy permissions: TCC database not readable (grant Full Disk Access to Terminal for detailed audit)"
+    fi
+}
+
+###############################################################################
+# CHECKS — Additional Software
+###############################################################################
+
+check_software_safari_privacy() {
+    local n=$1
+    if ! should_run_check "$n"; then return; fi
+    check_header "$n" "Safari Privacy & Security"
+
+    local issues=""
+
+    # Fraudulent website warnings
+    local warn_fraud
+    warn_fraud=$(defaults read com.apple.Safari WarnAboutFraudulentWebsites 2>/dev/null || echo "unknown")
+    if [[ "$warn_fraud" == "0" ]]; then
+        issues="${issues}  - Fraudulent website warnings are OFF\n"
+    fi
+
+    # Do Not Track header
+    local dnt
+    dnt=$(defaults read com.apple.Safari SendDoNotTrackHTTPHeader 2>/dev/null || echo "unknown")
+    if [[ "$dnt" == "0" ]]; then
+        issues="${issues}  - Do Not Track HTTP header is not sent\n"
+    fi
+
+    # Search engine
+    local search_engine
+    search_engine=$(defaults read com.apple.Safari SearchProviderShortName 2>/dev/null || echo "unknown")
+    if [[ "$search_engine" != "unknown" ]] && ! echo "$search_engine" | grep -qiE "DuckDuckGo|Ecosia|Startpage"; then
+        issues="${issues}  - Search engine: ${search_engine} (consider a privacy-focused alternative)\n"
+    fi
+
+    if [[ -n "$issues" ]]; then
+        medium "Safari privacy settings could be improved" \
+"$(echo -e "$issues")
+\`\`\`
+Fix: Safari > Settings > Privacy > enable tracking prevention
+     Safari > Settings > Search > choose DuckDuckGo or other privacy-focused engine
+     Safari > Settings > Security > enable fraudulent website warnings
+\`\`\`"
+        show_fix "Harden Safari privacy" \
+            "defaults write com.apple.Safari WarnAboutFraudulentWebsites -bool true" \
+            "defaults write com.apple.Safari SendDoNotTrackHTTPHeader -bool true"
+        _record_medium_json "Safari privacy settings could be improved" "Review Safari privacy configuration."
+    else
+        pass "Safari privacy settings appear reasonable"
+    fi
+}
+
+###############################################################################
 # MAIN EXECUTION
 ###############################################################################
 
@@ -1968,6 +2254,12 @@ check_software_review 33
 check_software_safari 34
 check_software_secure_keyboard 35
 check_software_docker 36
+check_encryption_recovery_key 37
+check_system_profiles 38
+check_system_mrt 39
+check_auth_password_policy 40
+check_privacy_tcc 41
+check_software_safari_privacy 42
 
 ###############################################################################
 # TERMINAL SUMMARY

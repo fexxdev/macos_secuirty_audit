@@ -41,7 +41,7 @@ Fix commands belong **only** inside quoted strings shown to the user (in `show_f
 
 - Pure Bash + standard macOS system utilities only.
 - No Homebrew, pip, npm, or any package manager at runtime.
-- Tools used: `defaults`, `csrutil`, `fdesetup`, `spctl`, `lsof`, `sysctl`, `system_profiler`, `systemsetup`, `sw_vers`, `dscl`, `stat`, `security`, `bioutil`, `softwareupdate`, `scutil`, `launchctl list` (read-only), `ps`, `grep`, `awk`, `sed`, `tmutil`, `pmset`.
+- Tools used: `defaults`, `csrutil`, `fdesetup`, `spctl`, `lsof`, `sysctl`, `system_profiler`, `systemsetup`, `sw_vers`, `dscl`, `stat`, `security`, `bioutil`, `softwareupdate`, `scutil`, `launchctl list` (read-only), `ps`, `grep`, `awk`, `sed`, `tmutil`, `pmset`, `profiles`, `pwpolicy`, `sqlite3`.
 
 ---
 

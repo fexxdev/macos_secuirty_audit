@@ -1,5 +1,28 @@
 # Release Notes
 
+## v2.1.0 — New Checks & Bug Fixes (2026-03-18)
+
+### New Checks (+6, 42 total)
+
+- FileVault Recovery Key — verifies a recovery key exists when FileVault is enabled
+- Configuration Profiles — detects MDM enrollment and installed configuration profiles
+- MRT / XProtect Remediator — verifies background malware removal tools are present
+- Password Policy — checks if a custom password policy is enforced
+- Privacy Permissions (TCC) — audits Camera, Microphone, Screen Recording, Accessibility, Full Disk Access grants
+- Safari Privacy & Security — fraudulent site warnings, Do Not Track, search engine choice
+
+### Bug Fixes
+
+- XProtect date parsing now handles multiple locale formats (ISO, US, EU) instead of assuming US English
+- Network exposure `lsof` parsing uses `$(NF-1)` instead of hardcoded field 9 for robustness
+- Login window password hint check validates numeric input before comparison
+
+### Improvements
+
+- Expanded LaunchAgent whitelist (1Password, Raycast, Spotify, Dropbox, Microsoft, Adobe, Docker, NordVPN, LuLu, Malwarebytes, Grammarly, Firefox, Brave)
+
+---
+
 ## v2.0.0 — Comprehensive Overhaul (2026-03-18)
 
 ### New Checks (+16, 36 total)

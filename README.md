@@ -1,6 +1,6 @@
 # macos-security-audit
 
-Comprehensive macOS security audit tool that runs 36 checks and generates a Markdown (or JSON) report with a letter grade.
+Comprehensive macOS security audit tool that runs 42 checks and generates a Markdown (or JSON) report with a letter grade.
 
 ```
 ╔══════════════════════════════════════════════════════╗
@@ -10,9 +10,9 @@ Comprehensive macOS security audit tool that runs 36 checks and generates a Mark
   Machine : Mac16,1 (Apple M4 Pro)
   macOS   : 15.3 (24D60)
 
-[1/36 2%] Disk Encryption (FileVault)
+[1/42 2%] Disk Encryption (FileVault)
   PASS  FileVault is ON
-[2/36 5%] Time Machine Backup & Encryption
+[2/42 4%] Time Machine Backup & Encryption
   PASS  Time Machine is enabled with encrypted backup
   ...
 
@@ -113,7 +113,7 @@ Outputs the report as a JSON object instead of Markdown:
   "version": "2.0.0",
   "score": 82,
   "grade": "B+",
-  "summary": { "critical": 0, "high": 2, "medium": 5, "pass": 29, "total": 36 },
+  "summary": { "critical": 0, "high": 2, "medium": 5, "pass": 35, "total": 42 },
   "findings": [...]
 }
 ```
@@ -139,7 +139,7 @@ When filtering, the report includes a "Partial audit" disclaimer.
 
 Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Issues found"`
 
-## Checks (36)
+## Checks (42)
 
 ### Encryption
 
@@ -147,6 +147,7 @@ Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Iss
 |----|-------|-------------------|
 | 1  | Disk Encryption (FileVault) | FileVault status |
 | 2  | Time Machine Backup & Encryption | Backup enabled + encryption status |
+| 37 | FileVault Recovery Key | Recovery key existence for data recovery |
 
 ### System
 
@@ -159,6 +160,8 @@ Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Iss
 | 7  | XProtect Definitions | Malware definition freshness |
 | 8  | Kernel Extensions | Third-party kexts loaded |
 | 9  | Find My Mac | Remote locate/lock/erase capability |
+| 38 | Configuration Profiles | MDM enrollment + installed configuration profiles |
+| 39 | MRT / XProtect Remediator | Background malware removal tool presence |
 
 ### Network
 
@@ -192,6 +195,7 @@ Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Iss
 | 25 | Login Window Configuration | Username list, password hints |
 | 26 | Touch ID | Fingerprint enrollment status |
 | 27 | USB Restricted Mode | Accessory connection policy when locked |
+| 40 | Password Policy | Password complexity and policy enforcement |
 
 ### Privacy
 
@@ -201,6 +205,7 @@ Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Iss
 | 29 | Analytics & Telemetry | Apple analytics, app developer sharing, Siri data |
 | 30 | Bluetooth Discoverability | Bluetooth power state + discoverability |
 | 31 | Siri Voice Trigger | Always-on microphone listening |
+| 41 | Privacy Permissions (TCC) | Camera, Microphone, Screen Recording, Accessibility, FDA grants |
 
 ### Software
 
@@ -211,6 +216,7 @@ Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Iss
 | 34 | Safari Safe File Auto-Open | Auto-open "safe" downloads |
 | 35 | Secure Keyboard Entry | Terminal keystroke interception protection |
 | 36 | Docker Daemons | Root-level Docker LaunchDaemons |
+| 42 | Safari Privacy & Security | Fraud warnings, tracking prevention, search engine |
 
 ## Scoring
 
