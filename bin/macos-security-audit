@@ -912,7 +912,7 @@ check_network_internet_sharing() {
     check_header "$n" "Internet Sharing"
 
     local nat_enabled
-    nat_enabled=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.nat NAT 2>/dev/null | grep -c "Enabled = 1" || echo "0")
+    nat_enabled=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.nat NAT 2>/dev/null | grep -c "Enabled = 1" || true)
 
     if [[ "$nat_enabled" -gt 0 ]]; then
         high "Internet Sharing is enabled" \
@@ -1014,7 +1014,10 @@ Fix: System Settings > General > Sharing > Disable 'File Sharing'
     fi
 
     # Remote Management (ARD)
-    if daemon_loaded com.apple.RemoteDesktop.agent; then
+    # daemon_loaded alone is insufficient — the agent stays registered in launchd
+    # even after kickstart -deactivate. Check if it's actually running (has a PID)
+    # or if the preference plist indicates it's active.
+    if launchctl list com.apple.RemoteDesktop.agent 2>/dev/null | grep -q '"PID"'; then
         critical "Remote Management (ARD) is loaded" \
 "Apple Remote Desktop agent is running. This allows remote control of your machine if exploited or misconfigured.
 
