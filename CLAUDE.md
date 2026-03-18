@@ -41,7 +41,7 @@ Fix commands belong **only** inside quoted strings shown to the user (in `show_f
 
 - Pure Bash + standard macOS system utilities only.
 - No Homebrew, pip, npm, or any package manager at runtime.
-- Tools used: `defaults`, `csrutil`, `fdesetup`, `spctl`, `lsof`, `sysctl`, `system_profiler`, `systemsetup`, `sw_vers`, `dscl`, `stat`, `security`, `bioutil`, `softwareupdate`, `scutil`, `launchctl list` (read-only), `ps`, `grep`, `awk`, `sed`.
+- Tools used: `defaults`, `csrutil`, `fdesetup`, `spctl`, `lsof`, `sysctl`, `system_profiler`, `systemsetup`, `sw_vers`, `dscl`, `stat`, `security`, `bioutil`, `softwareupdate`, `scutil`, `launchctl list` (read-only), `ps`, `grep`, `awk`, `sed`, `tmutil`, `pmset`.
 
 ---
 
@@ -65,11 +65,13 @@ Fix commands belong **only** inside quoted strings shown to the user (in `show_f
 ### Adding a New Check
 
 1. Increment `TOTAL_CHECKS` at the top.
-2. Add a new `###` section with the next number.
+2. Create a new `check_<category>_<name>()` function following the standardised pattern.
 3. Use `pass()`, `critical()`, `high()`, or `medium()` to record the finding.
-4. Add a `show_fix` call for the `--show-fix` flag.
-5. Update the checks table in `README.md` and the `usage()` function.
-6. Add a release note entry.
+4. Add a `show_fix` call for the `--show-fix` flag, followed by the corresponding `_record_<severity>_json` call.
+5. Add the function call in the execution block with the next check number.
+6. Update `check_category()`, `list_checks()`, and `usage()` with the new check.
+7. Update the checks table in `README.md`.
+8. Add a release note entry.
 
 ---
 

@@ -1,5 +1,51 @@
 # Release Notes
 
+## v2.0.0 — Comprehensive Overhaul (2026-03-18)
+
+### New Checks (+16, 36 total)
+
+- Time Machine Backup & Encryption
+- Rapid Security Response
+- XProtect Definitions
+- Kernel Extensions
+- Find My Mac
+- Internet Sharing
+- Wake on Network Access
+- Remote Apple Events
+- Content Caching
+- Printer Sharing
+- Media Sharing
+- Handoff
+- Screen Saver Timeout
+- Login Window Configuration
+- Safari Safe File Auto-Open
+- Secure Keyboard Entry (Terminal)
+
+### New Features
+
+- `--json` — JSON output format for scripting and dashboards
+- `--category` — run only checks in specific categories (encryption, system, network, sharing, auth, privacy, software)
+- `--quiet` — suppress terminal output, print only the grade
+- `--no-color` — disable ANSI colour codes (auto-detected when piping)
+- `--version` — print version and exit
+- `--list-checks` — list all 36 checks with categories
+- Exit codes reflect grade (0 = A/B, 1 = C, 2 = D/F)
+- Terminal summary table with boxed layout at completion
+- Progress percentage in check headers (e.g., `[3/36 8%]`)
+
+### Internal Improvements
+
+- All checks refactored into named functions (`check_<category>_<name>`)
+- Category-based organization (7 categories)
+- Standardised check pattern across all 36 checks
+- Docker and Siri voice trigger split into dedicated checks
+- Certificates check merged into Installed Software & Persistence
+- JSON escaping helper for safe structured output
+- Quiet-mode aware output functions
+- Spinner respects quiet mode
+
+---
+
 ## v1.0.0 — Initial Release (2026-02-06)
 
 First public release of `macos-security-audit`.
