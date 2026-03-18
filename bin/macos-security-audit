@@ -784,7 +784,7 @@ Fix: Bind services to 127.0.0.1 (localhost) or stop them if not needed.
      For nginx: change 'listen 8080' to 'listen 127.0.0.1:8080' in nginx.conf
      To stop nginx: brew services stop nginx
 \`\`\`"
-        qecho "$PORT_LIST"
+        qecho "${PORT_LIST//  - /          - }"
         show_fix "Stop exposed services (examples)" \
             "brew services stop nginx" \
             "# Or bind to localhost in service configuration"
@@ -1674,7 +1674,7 @@ $(echo -e "$OFFENSIVE_TOOLS")
 \`\`\`
 Fix: Uninstall any you're not actively using. Keep them in a VM if needed for security work.
 \`\`\`"
-        qecho -e "$OFFENSIVE_TOOLS"
+        qecho -e "${OFFENSIVE_TOOLS//  - /          - }"
         show_fix "Uninstall unused offensive tools (example)" \
             "brew uninstall nmap" \
             "# Or remove from /Applications"
@@ -1766,7 +1766,7 @@ Fix: Review each one. Remove unneeded agents:
      launchctl unload ~/Library/LaunchAgents/<plist>
      rm ~/Library/LaunchAgents/<plist>
 \`\`\`"
-            qecho -e "$UNKNOWN_AGENTS"
+            qecho -e "${UNKNOWN_AGENTS//  - /          - }"
             show_fix "Remove unwanted LaunchAgents (example)" \
                 "launchctl unload ~/Library/LaunchAgents/<plist-name>" \
                 "rm ~/Library/LaunchAgents/<plist-name>"
