@@ -1,6 +1,6 @@
 # macos-security-audit
 
-[![CI](https://github.com/fexxdev/macos_secuirty_audit/actions/workflows/ci.yml/badge.svg)](https://github.com/fexxdev/macos_secuirty_audit/actions/workflows/ci.yml)
+[![CI](https://github.com/fexxdev/macos_security_audit/actions/workflows/ci.yml/badge.svg)](https://github.com/fexxdev/macos_security_audit/actions/workflows/ci.yml)
 
 Comprehensive macOS security audit tool that runs 48 checks and generates a Markdown (or JSON) report with a letter grade.
 
@@ -39,15 +39,15 @@ enforces all three on every run.
 ### Homebrew
 
 ```bash
-brew tap fexxdev/macos_secuirty_audit https://github.com/fexxdev/macos_secuirty_audit
+brew tap fexxdev/macos_security_audit https://github.com/fexxdev/macos_security_audit
 brew install macos-security-audit
 ```
 
 ### Make
 
 ```bash
-git clone https://github.com/fexxdev/macos_secuirty_audit.git
-cd macos_secuirty_audit
+git clone https://github.com/fexxdev/macos_security_audit.git
+cd macos_security_audit
 make install          # installs to /usr/local/bin
 # make uninstall      # removes it
 ```
@@ -55,8 +55,8 @@ make install          # installs to /usr/local/bin
 ### Manual
 
 ```bash
-git clone https://github.com/fexxdev/macos_secuirty_audit.git
-cd macos_secuirty_audit
+git clone https://github.com/fexxdev/macos_security_audit.git
+cd macos_security_audit
 ./bin/macos-security-audit
 ```
 

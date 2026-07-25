@@ -1,7 +1,7 @@
 class MacosSecurityAudit < Formula
   desc "Comprehensive macOS security audit with Markdown report generation"
-  homepage "https://github.com/fexxdev/macos_secuirty_audit"
-  url "https://github.com/fexxdev/macos_secuirty_audit/archive/refs/tags/v3.1.0.tar.gz"
+  homepage "https://github.com/fexxdev/macos_security_audit"
+  url "https://github.com/fexxdev/macos_security_audit/archive/refs/tags/v3.1.0.tar.gz"
   # sha256 "UPDATE_WITH_ACTUAL_SHA256_AFTER_RELEASE"
   license "MIT"
   version "3.1.0"
