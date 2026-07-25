@@ -1,5 +1,131 @@
 # Release Notes
 
+## v3.1.0 — Trust, Persistence & Change Detection (2026-07-26)
+
+Six new checks, a baseline diff, and attack chains. 42 checks → 48.
+
+Every new check that interprets a system value was verified the same way: read
+the value with the setting off, read it again with the setting on, and confirm
+the difference — before the check was written. Two things this release could
+have shipped are deliberately missing for exactly that reason; they are listed
+at the bottom.
+
+### New: `--baseline FILE`
+
+Compare the current run against a previous `--json` report and report only what
+changed:
+
+```bash
+macos-security-audit --json --output baseline.json      # week 1
+macos-security-audit --baseline baseline.json           # week 2
+```
+
+```
+  Changes since baseline (2026-07-19T08:02:11Z)
+  Score 82 → 78    Grade B+ → B
+  NEW       [11] HIGH  Services listening on all network interfaces
+  RESOLVED  [3] CRITICAL  SIP is DISABLED
+```
+
+This is what turns the tool from a snapshot into a monitor: a new listening
+port, a new LaunchAgent, a root CA that appeared overnight, SIP switched off
+while you were not looking.
+
+**The diff never moves the score and never changes the exit code.** "This
+appeared since Tuesday" is a fact about time, not about how hardened the machine
+is right now, and a grade that drifted with the age of a baseline file would
+mean nothing. A `--category` run filters the baseline through the same category
+predicate, so checks that did not run are not reported as resolved.
+
+The diff appears in all three outputs — terminal, Markdown (`## Changes Since
+Baseline`) and JSON (a `baseline` object, `null` when the flag is absent).
+
+### New: attack chains
+
+Some findings are worse together than apart. FileVault off is bad and auto-login
+is bad; together they mean whoever picks the Mac up is at your desktop, and
+whoever pulls the drive out reads it elsewhere — both barriers gone at once.
+Scoring each check in isolation has no way to say that.
+
+Five chains ship in this release:
+
+1. FileVault off **+** auto-login on
+2. SSH listening **+** firewall off
+3. SIP off **+** Gatekeeper off
+4. A trusted root CA **+** non-local IPs pinned in `/etc/hosts`
+5. mkcert's CA private key readable **+** that CA trusted as a root
+
+**A chain deducts nothing.** Every finding it references has already cost the
+score what it costs; charging twice would make the grade depend on how many
+chains happen to have been written down. What a chain changes is the order worth
+fixing things in — which is the part the severity column was never able to tell
+you.
+
+### New checks (43–48)
+
+- **43 · Trusted Root Certificates** — enumerates the admin and user trust
+  domains from `security dump-trust-settings`. A certificate trusted as a root
+  CA can sign for any hostname your Mac will accept. Apple's own 157-cert system
+  store is deliberately not enumerated; it is not the interesting part.
+  `kSecTrustSettingsResultDeny` is reported as what it is — an improvement — and
+  a certificate with no `Result Type` (which is how the user domain prints them)
+  is reported as *unstated* rather than assumed to grant root trust.
+- **44 · Startup & Login Items** — `/Library/LaunchAgents` (the system-wide path
+  the existing check 33 did not cover) plus `LoginHook`/`LogoutHook`, which run
+  arbitrary scripts at every login and logout.
+- **45 · Shell Startup Files** — `~/.zshrc`, `~/.zprofile`, `~/.bashrc` and six
+  siblings, plus the `/etc` copies. A file anyone can write to is code execution
+  as you on the next terminal window. Only the filename and which pattern
+  matched are ever reported — never the matching line. Shell startup files are
+  where people keep API tokens, and a security report that leaks one has made
+  things worse.
+- **46 · Sudo Configuration** — drop-ins in `/etc/sudoers.d/`, flagged when one
+  grants `NOPASSWD`. Filenames only, never contents. `/etc/sudoers` itself is
+  mode 0440 root:wheel and out of reach without root; the check says so.
+- **47 · Login Authorization Plugins** — the `system.login.console` mechanism
+  chain. Third-party login plugins (JAMF Connect, NoMAD, Okta) see the password
+  as it is typed. Bundles in `/Library/Security/SecurityAgentPlugins` that are
+  registered but not in the chain are reported separately — that is usually
+  uninstall residue, and it is worth knowing which.
+- **48 · Browser Extensions** — Chromium-family extensions across ten profile
+  roots, with the high-impact permissions each one declares (`<all_urls>`,
+  `debugger`, `nativeMessaging`, `cookies`, `webRequest`, …). Read offline from
+  each extension's own `manifest.json`; `__MSG_` names are resolved through the
+  extension's `_locales` so the report shows "1Password – Password Manager", not
+  a 32-character ID.
+
+### Fixes
+
+- **The Markdown report crashed when nothing passed.** Under `set -u`, bash 3.2
+  treats `"\${PASSES[@]}"` on an empty array as an unbound variable. A
+  `--category` run where every check fails is not hypothetical.
+
+### Internal
+
+- The test suite grew from 74 to 117 tests, covering every new helper, the
+  baseline diff, and all five attack chains from both sides — including that a
+  chain never fires on a passing check and never moves the score.
+- shellcheck is clean at `-S style`, its strictest level, for both the script
+  and the test suite. The CI job that ran it was marked `continue-on-error` and
+  had been failing silently; the flag is gone and the job is now binding.
+- `ps aux | grep` for VPN processes replaced with `pgrep -if`.
+
+### Deliberately not shipped
+
+Two things that would have looked good in this list and are not in it:
+
+- **CIS macOS Benchmark identifiers.** Anchoring the score to a published
+  benchmark instead of the current `-8/-4/-2` is the right idea. Writing
+  "CIS 2.4.1" next to a check without the benchmark document in hand is
+  fabrication, and this project has spent a release fixing exactly that class of
+  mistake. It stays out until the mapping can be checked against the source.
+- **Firefox extensions.** Check 48 covers the Chromium family only. There is no
+  Firefox profile on the machine this was developed on, so the `.xpi` and
+  `extensions.json` parsing could not be verified against real data — and an
+  unverified parser in a security tool reports confident nonsense. The gap is
+  stated in the check's own output rather than hidden. Safari extensions have
+  the same status: their container is SIP-protected and not readable.
+
 ## v3.0.0 — Correctness, Safety & Tests (2026-07-25)
 
 No new checks — this release makes the 42 existing ones trustworthy. Three of

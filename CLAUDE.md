@@ -47,7 +47,10 @@ Fix commands belong **only** inside quoted strings shown to the user (in `show_f
 
 - Pure Bash + standard macOS system utilities only.
 - No Homebrew, pip, npm, or any package manager at runtime.
-- Tools used: `defaults`, `csrutil`, `fdesetup`, `spctl`, `lsof`, `sysctl`, `system_profiler`, `systemsetup`, `sw_vers`, `dscl`, `stat`, `security`, `bioutil`, `softwareupdate`, `scutil`, `launchctl list` (read-only), `ps`, `grep`, `awk`, `sed`, `tmutil`, `pmset`, `profiles`, `pwpolicy`, `sqlite3`.
+- Tools used: `defaults`, `csrutil`, `fdesetup`, `spctl`, `lsof`, `sysctl`, `system_profiler`, `systemsetup`, `sw_vers`, `dscl`, `stat`, `security`, `bioutil`, `softwareupdate`, `scutil`, `launchctl list` (read-only), `pgrep`, `ps`, `grep`, `awk`, `sed`, `comm`, `sort`, `find`, `tmutil`, `pmset`, `profiles`, `pwpolicy`, `sqlite3`.
+- The `--baseline` diff uses `comm` with process substitution rather than temp
+  files, because `rm` is one of the commands the static guard forbids and the
+  tool has no business creating files it then has to delete.
 
 ---
 
@@ -156,6 +159,46 @@ caught. If you weaken a guard, re-run that exercise.
 | `pass()` | Check passed, no action needed | 0 |
 
 Be conservative with severity. A `critical` should mean "fix this today or accept serious risk."
+
+### Attack Chains
+
+`evaluate_attack_chains()` reports combinations that are worse than the sum of
+their parts. Two rules govern it:
+
+- **A chain must never deduct from the score.** Every finding it references has
+  already been counted once by the check that recorded it. Charging twice would
+  make the grade depend on how many chains happen to have been written down.
+- **A chain keys on the exact summary text of the findings it combines**, via
+  `has_finding <check> <summary substring>`. If you reword a summary, the chain
+  that depends on it stops firing — the test suite has a fixture per chain
+  precisely so that this fails loudly instead of silently.
+
+---
+
+## Verifying a Check Before Writing It
+
+Every check that interprets a system value must be verified against the live
+system **before** the check is written:
+
+1. Read the raw value with the setting **off**.
+2. Change the setting in System Settings, read it again.
+3. Confirm the difference is what you assumed it would be.
+
+This rule exists because two shipped checks had their polarity backwards — one
+read the value macOS writes when you opt *out* and reported it as opted *in*.
+Coverage that grows faster than reliability is worse than no coverage: it
+produces confident output that is wrong.
+
+The corollary: **if you cannot verify it, do not ship it.** Two things are
+deliberately absent for this reason and should stay absent until they can be
+checked against a real source:
+
+- **CIS macOS Benchmark identifiers.** Writing "CIS 2.4.1" next to a check
+  without the benchmark document in hand is fabrication.
+- **Firefox extension parsing** (check 48 covers the Chromium family only).
+  There was no Firefox profile on the development machine to verify the `.xpi` /
+  `extensions.json` format against. The gap is stated in the check's own output
+  rather than hidden.
 
 ---
 

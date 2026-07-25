@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/fexxdev/macos_secuirty_audit/actions/workflows/ci.yml/badge.svg)](https://github.com/fexxdev/macos_secuirty_audit/actions/workflows/ci.yml)
 
-Comprehensive macOS security audit tool that runs 42 checks and generates a Markdown (or JSON) report with a letter grade.
+Comprehensive macOS security audit tool that runs 48 checks and generates a Markdown (or JSON) report with a letter grade.
 
 Read-only, offline by default, no dependencies — and the test suite in `tests/`
 enforces all three on every run.
@@ -15,9 +15,9 @@ enforces all three on every run.
   Machine : Mac16,1 (Apple M4 Pro)
   macOS   : 15.3 (24D60)
 
-[1/42 2%] Disk Encryption (FileVault)
+[1/48 2%] Disk Encryption (FileVault)
   PASS  FileVault is ON
-[2/42 4%] Time Machine Backup & Encryption
+[2/48 4%] Time Machine Backup & Encryption
   PASS  Time Machine is enabled with encrypted backup
   ...
 
@@ -79,6 +79,9 @@ macos-security-audit --json --output report.json
 # Run only specific categories
 macos-security-audit --category encryption,network
 
+# Compare against a previous JSON report and show only what changed
+macos-security-audit --baseline last-week.json
+
 # Quiet mode — print only the grade
 macos-security-audit --quiet
 
@@ -126,7 +129,7 @@ terminal would print:
 
 ```json
 {
-  "version": "3.0.0",
+  "version": "3.1.0",
   "timestamp": "2026-07-25T09:14:02Z",
   "machine": { "model": "Mac15,6", "chip": "Apple M3 Pro", "macos_version": "26.5.2", "build": "25F84", "serial": "REDACTED" },
   "score": 82,
@@ -134,7 +137,9 @@ terminal would print:
   "offline": true,
   "partial_audit": false,
   "categories_checked": "all",
-  "summary": { "critical": 0, "high": 2, "medium": 5, "pass": 35, "checks_run": 42, "total": 42 },
+  "summary": { "critical": 0, "high": 2, "medium": 5, "pass": 35, "checks_run": 48, "total": 48 },
+  "attack_chains": [],
+  "baseline": null,
   "findings": [
     {
       "check_number": 10,
@@ -148,6 +153,60 @@ terminal would print:
   ]
 }
 ```
+
+## `--baseline`
+
+A single audit tells you the state of the machine. Two audits tell you what
+changed since — and that is usually the part you actually want to see.
+
+```bash
+macos-security-audit --json --output baseline.json      # week 1
+macos-security-audit --baseline baseline.json           # week 2
+```
+
+```
+  Changes since baseline (2026-07-19T08:02:11Z)
+  Score 82 → 78    Grade B+ → B
+  NEW       [11] HIGH  Services listening on all network interfaces
+  RESOLVED  [3] CRITICAL  SIP is DISABLED
+```
+
+A new listening port, a new LaunchAgent, a trusted root certificate that
+appeared overnight, SIP switched off while you were not looking.
+
+**The diff never changes the score and never changes the exit code.** "This
+appeared since Tuesday" is a fact about time, not about how hardened the machine
+is right now; a grade that drifted with the age of a baseline file would mean
+nothing. Combined with `--category`, the baseline is filtered through the same
+category predicate, so checks that did not run are not reported as resolved.
+
+The diff appears in the terminal, in the Markdown report as
+`## Changes Since Baseline`, and in JSON as a `baseline` object (`null` when the
+flag is absent).
+
+## Attack Chains
+
+Some findings are worse together than apart. FileVault off is bad and auto-login
+is bad; together they mean whoever picks the Mac up is at your desktop, and
+whoever pulls the drive out reads it elsewhere — both barriers gone at once.
+Scoring each check on its own has no way to say that, so the report says it
+separately:
+
+| # | Chain |
+|---|---|
+| 1 | FileVault off **+** auto-login on |
+| 2 | SSH listening **+** firewall off |
+| 3 | SIP off **+** Gatekeeper off |
+| 4 | A trusted root CA **+** non-local IPs pinned in `/etc/hosts` |
+| 5 | mkcert's CA private key readable **+** that CA trusted as a root |
+
+**A chain deducts nothing.** Every finding it references has already cost the
+score what it costs, and charging twice would make the grade depend on how many
+chains happen to have been written down. What a chain changes is the order worth
+fixing things in.
+
+Chains appear in the terminal, in the Markdown report, and in JSON as
+`attack_chains` (an empty array when none fire).
 
 ## `--online`
 
@@ -187,7 +246,7 @@ mistaken for a bad security grade.
 
 Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Issues found"`
 
-## Checks (42)
+## Checks (48)
 
 ### Encryption
 
@@ -210,6 +269,7 @@ Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Iss
 | 9  | Find My Mac | Remote locate/lock/erase capability |
 | 38 | Configuration Profiles | MDM enrollment + installed configuration profiles |
 | 39 | MRT / XProtect Remediator | Background malware removal tool presence |
+| 43 | Trusted Root Certificates | Certificates manually trusted as root CAs (admin + user domains) |
 
 ### Network
 
@@ -244,6 +304,8 @@ Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Iss
 | 26 | Touch ID | Fingerprint enrollment status |
 | 27 | USB Restricted Mode | Accessory connection policy when locked |
 | 40 | Password Policy | Password complexity and policy enforcement |
+| 46 | Sudo Configuration | `/etc/sudoers.d/` drop-ins, NOPASSWD rules |
+| 47 | Login Authorization Plugins | Third-party plugins in the `system.login.console` chain |
 
 ### Privacy
 
@@ -265,6 +327,9 @@ Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Iss
 | 35 | Secure Keyboard Entry | Terminal keystroke interception protection |
 | 36 | Docker Daemons | Root-level Docker LaunchDaemons |
 | 42 | Safari Privacy & Security | Fraud warnings, tracking prevention, search engine |
+| 44 | Startup & Login Items | `/Library/LaunchAgents`, login/logout hooks |
+| 45 | Shell Startup Files | Writable or suspicious `.zshrc`/`.bashrc`/`.profile` |
+| 48 | Browser Extensions | Chromium-family extensions and the permissions they declare |
 
 ## Scoring
 
@@ -277,6 +342,10 @@ Each finding deducts from a starting score of 100:
 | MEDIUM | -2 |
 
 The final score maps to a letter grade (A+ through F).
+
+Two things deliberately do **not** touch the score: attack chains (every finding
+they reference is already counted once) and the `--baseline` diff (it describes
+change over time, not the current state of the machine).
 
 ## Output
 
@@ -309,9 +378,11 @@ make lint      # syntax + shellcheck only
 ```
 
 `tests/run-tests.sh` is pure Bash with no dependencies (shellcheck and python3
-are used when installed and skipped when not). It covers the check registry, the
-CLI contract, both report formats, and the read-only/offline static guards. CI
-runs it on macOS for every push and pull request.
+are used when installed and skipped when not). Its 117 tests cover the check
+registry, the CLI contract, every pure helper, both report formats, the baseline
+diff, all five attack chains, and the read-only/offline static guards. CI runs it
+on macOS for every push and pull request, and separately runs shellcheck at
+`-S style` — its strictest level — over both the script and the suite.
 
 Adding a check is two steps: write a `check_<category>_<name>()` function, then
 append one line to the `CHECKS` array. The check number, category filter,

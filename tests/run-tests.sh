@@ -102,6 +102,10 @@ assert_empty "no 'local' outside a function body" "$LOCAL_ESCAPES"
 # first, with a small lexer that carries quote state across lines (the detail
 # arguments are multi-line strings) and stops at a `#` that starts a comment.
 # What survives is the code the script actually executes.
+#
+# The single quotes are load-bearing: this is an awk program, and nothing in it
+# may be expanded by the shell before awk sees it.
+# shellcheck disable=SC2016
 STRIP_STRINGS='
 function strip(s,   i, n, ch, out) {
     n = length(s); out = ""
@@ -153,10 +157,14 @@ assert_empty "no mutating or network command outside a string literal" "$MUTATIO
 # The single network-capable call must stay behind --online. If it ever drifts
 # out of that branch, the offline guarantee in the README quietly becomes false.
 SU_UNGUARDED=""
-for _line in $(awk "$STRIP_STRINGS"'{ if (strip($0) ~ /softwareupdate/) print FNR }' "$AUDIT"); do
+while IFS= read -r _line; do
+    [[ -z "$_line" ]] && continue
     _prev=$(sed -n "$((_line - 1))p" "$AUDIT" | tr -d '[:space:]')
+    # Compared against the guard line with whitespace removed, so this literal
+    # must not be expanded — the single quotes are deliberate.
+    # shellcheck disable=SC2016
     [[ "$_prev" == 'if$ONLINE_MODE;then' ]] || SU_UNGUARDED="${SU_UNGUARDED}line ${_line} "
-done
+done < <(awk "$STRIP_STRINGS"'{ if (strip($0) ~ /softwareupdate/) print FNR }' "$AUDIT")
 assert_empty "softwareupdate runs only inside 'if \$ONLINE_MODE'" "$SU_UNGUARDED"
 
 ###############################################################################
@@ -169,7 +177,7 @@ assert_eq "--version matches VERSION in the script" "$FILE_VERSION" "$CLI_VERSIO
 
 HELP=$("$AUDIT" --help 2>&1); HELP_RC=$?
 assert_eq "--help exits 0" "0" "$HELP_RC"
-for _flag in --show-fix --output --json --category --quiet --no-color --redact --online --list-checks --version; do
+for _flag in --show-fix --output --json --category --baseline --quiet --no-color --redact --online --list-checks --version; do
     assert_contains "--help documents $_flag" "$_flag" "$HELP"
 done
 assert_contains "--help documents the exit codes" "EXIT CODES" "$HELP"
@@ -180,6 +188,13 @@ assert_exit "--category with no value exits 64" 64 --category
 assert_exit "--output with no value exits 64"  64 --output
 assert_exit "unwritable output dir exits 64"   64 --output /nonexistent-dir-msa/report.md
 assert_exit "output path that is a dir exits 64" 64 --output "$WORK"
+
+# A bad baseline is rejected before the audit runs, not after 40 seconds of work.
+printf 'not a report\n' > "$WORK/notjson.txt"
+assert_exit "--baseline with no value exits 64"     64 --baseline
+assert_exit "missing baseline file exits 64"        64 --baseline "$WORK/absent.json"
+assert_exit "baseline that is a directory exits 64" 64 --baseline "$WORK"
+assert_exit "baseline that is not a report exits 64" 64 --baseline "$WORK/notjson.txt"
 
 # --opt=value must behave exactly like --opt value.
 OUT_EQ="$WORK/eq.md"
@@ -365,6 +380,167 @@ fi
 
 assert_eq "md_cell escapes table-breaking pipes" 'a\|b' "$(md_cell 'a|b')"
 
+# `security dump-trust-settings` prints one Result Type per policy. Deny is the
+# only one that makes the machine *safer*, so reporting it as a risk would flag
+# exactly the wrong certificate. The user domain prints no Result Type at all,
+# which is reported as unstated rather than guessed at.
+assert_eq "trust_result_risk: TrustRoot is full CA trust" "root" \
+    "$(trust_result_risk kSecTrustSettingsResultTrustRoot)"
+assert_eq "trust_result_risk: TrustAsRoot is a pinned leaf" "leaf" \
+    "$(trust_result_risk kSecTrustSettingsResultTrustAsRoot)"
+assert_eq "trust_result_risk: Deny is not a risk" "deny" \
+    "$(trust_result_risk kSecTrustSettingsResultDeny)"
+assert_eq "trust_result_risk: Unspecified" "unspecified" \
+    "$(trust_result_risk kSecTrustSettingsResultUnspecified)"
+assert_eq "trust_result_risk: a missing Result Type is unstated, not assumed" "unstated" \
+    "$(trust_result_risk '')"
+assert_eq "trust_result_risk: zero trust settings is none" "none" \
+    "$(trust_result_risk none)"
+assert_eq "trust_result_risk: an unrecognised type is not silently trusted" "other" \
+    "$(trust_result_risk kSecTrustSettingsResultSomethingNew)"
+
+# A certificate carries one setting per policy and they can disagree. Ranking
+# them lets the strongest win, so a cert is never labelled by whichever setting
+# happened to be parsed last.
+if (( $(trust_risk_rank root) > $(trust_risk_rank leaf) )) \
+   && (( $(trust_risk_rank leaf) > $(trust_risk_rank deny) )) \
+   && (( $(trust_risk_rank deny) > $(trust_risk_rank unspecified) )) \
+   && (( $(trust_risk_rank unspecified) > $(trust_risk_rank unstated) )) \
+   && (( $(trust_risk_rank unstated) > $(trust_risk_rank none) )); then
+    ok "trust_risk_rank orders every trust result"
+else
+    bad "trust_risk_rank orders every trust result"
+fi
+
+# Third-party login plugins (JAMF Connect, NoMAD, Okta) sit in this chain under
+# their own bundle prefix. Apple's own providers must not be reported as one.
+if login_mechanism_is_apple "builtin:policy-banner" \
+   && login_mechanism_is_apple "loginwindow:login" \
+   && login_mechanism_is_apple "CryptoTokenKit:login" \
+   && ! login_mechanism_is_apple "com.jamf.connect.login:AuthUI" \
+   && ! login_mechanism_is_apple "NoMADLoginAD:Notify"; then
+    ok "login_mechanism_is_apple separates Apple providers from third-party ones"
+else
+    bad "login_mechanism_is_apple separates Apple providers from third-party ones"
+fi
+
+# Tested arithmetically on the octal mode. String-matching a 9-character listing
+# is how "-rw-rw-r--" and "-rw-r--rw-" end up treated the same.
+assert_eq "mode 644 is not group/world writable" "no" \
+    "$(mode_is_group_or_world_writable 644 && echo yes || echo no)"
+assert_eq "mode 664 is group writable" "yes" \
+    "$(mode_is_group_or_world_writable 664 && echo yes || echo no)"
+assert_eq "mode 646 is world writable" "yes" \
+    "$(mode_is_group_or_world_writable 646 && echo yes || echo no)"
+assert_eq "mode 600 is not group/world writable" "no" \
+    "$(mode_is_group_or_world_writable 600 && echo yes || echo no)"
+assert_eq "a non-numeric mode is not treated as writable" "no" \
+    "$(mode_is_group_or_world_writable '-rw-rw-r--' && echo yes || echo no)"
+
+# json_unescape must be the exact inverse of json_escape, including the case
+# that a naive sequence of substitutions gets wrong: a literal backslash-n.
+for _s in 'plain' 'has "quotes"' 'back\slash' 'literal \n not a newline' "$(printf 'real\nnewline\ttab')"; do
+    _round=$(json_unescape "$(json_escape "$_s")")
+    [[ "$_round" == "$_s" ]] || JSON_ROUNDTRIP="${JSON_ROUNDTRIP:-}${_s} -> ${_round}"$'\n'
+done
+assert_empty "json_unescape round-trips everything json_escape produces" "${JSON_ROUNDTRIP:-}"
+
+# The baseline diff parses the JSON report with sed, which only works because
+# render_json puts each finding on one line. This is the shape it must keep.
+BASE_JSON="$WORK/baseline.json"
+cat > "$BASE_JSON" <<'EOF'
+{
+  "score": 71,
+  "grade": "B-",
+  "timestamp": "2026-01-02T03:04:05Z",
+  "findings": [
+    {"check_number":3,"category":"system","title":"SIP","severity":"critical","summary":"SIP is DISABLED","detail":"d","fix":null},
+    {"check_number":10,"category":"network","title":"FW","severity":"pass","summary":"Firewall is ON","detail":"","fix":null},
+    {"check_number":43,"category":"system","title":"Roots","severity":"high","summary":"1 certificate(s) are trusted as a root CA","detail":"d","fix":null}
+  ]
+}
+EOF
+assert_eq "baseline_findings reduces a report to check|severity|summary" \
+    "3|critical|SIP is DISABLED
+43|high|1 certificate(s) are trusted as a root CA" \
+    "$(baseline_findings "$BASE_JSON")"
+assert_eq "baseline_findings drops passes" "" \
+    "$(baseline_findings "$BASE_JSON" | grep '|pass|' || true)"
+assert_eq "baseline_meta reads the top-level score" "71" "$(baseline_meta "$BASE_JSON" score)"
+assert_eq "baseline_meta reads the top-level grade" "B-" "$(baseline_meta "$BASE_JSON" grade)"
+assert_eq "baseline_meta reads the timestamp" "2026-01-02T03:04:05Z" \
+    "$(baseline_meta "$BASE_JSON" timestamp)"
+
+# A --category run must not report every check it did not run as "resolved".
+# shellcheck disable=SC2034  # read by the sourced should_run_check
+CATEGORY_FILTER="network"
+assert_eq "baseline_findings_active honours the category filter" "" \
+    "$(baseline_findings_active "$BASE_JSON")"
+# shellcheck disable=SC2034  # read by the sourced should_run_check
+CATEGORY_FILTER=""
+
+assert_eq "format_diff_line renders a diff entry" \
+    "[43] HIGH  1 certificate(s) are trusted as a root CA" \
+    "$(format_diff_line '43|high|1 certificate(s) are trusted as a root CA')"
+assert_eq "diff_line_field extracts the check number" "43" \
+    "$(diff_line_field '43|high|a|b' num)"
+assert_eq "diff_line_field extracts the severity" "high" \
+    "$(diff_line_field '43|high|a|b' sev)"
+assert_eq "diff_line_field keeps pipes inside the summary" "a|b" \
+    "$(diff_line_field '43|high|a|b' summary)"
+
+# ── Attack chains ────────────────────────────────────────────────────
+# Each chain keys on the exact summary text of the findings it combines, so
+# these fixtures double as a check that those strings still exist.
+_fake_finding() {
+    F_NUM+=("$1"); F_CAT+=("x"); F_TITLE+=("x")
+    F_SEV+=("$2"); F_SUMMARY+=("$3"); F_DETAIL+=(""); F_FIX+=("")
+}
+_reset_findings() {
+    F_NUM=(); F_CAT=(); F_TITLE=(); F_SEV=(); F_SUMMARY=(); F_DETAIL=(); F_FIX=()
+    CHAIN_TITLES=(); CHAIN_BODIES=()
+}
+
+_reset_findings
+_fake_finding 1  critical "FileVault is OFF"
+_fake_finding 22 critical "Auto-login is ENABLED"
+_fake_finding 16 high     "Remote Login (SSH) is enabled"
+_fake_finding 10 critical "Firewall is DISABLED"
+_fake_finding 3  critical "SIP is DISABLED"
+_fake_finding 4  critical "Gatekeeper is DISABLED"
+_fake_finding 12 high     "External/production IPs found in /etc/hosts"
+_fake_finding 43 high     "1 certificate(s) are trusted as a root CA"
+_fake_finding 33 high     "mkcert root CA key has loose permissions (644)"
+_SCORE_BEFORE=$SCORE
+evaluate_attack_chains
+assert_eq "every attack chain fires on the findings it is written against" "5" "${#CHAIN_TITLES[@]}"
+assert_eq "every fired chain has a body" "${#CHAIN_TITLES[@]}" "${#CHAIN_BODIES[@]}"
+# A chain must never move the score: every finding it references is already
+# counted once by the check that recorded it.
+assert_eq "attack chains do not change the score" "$_SCORE_BEFORE" "$SCORE"
+
+_reset_findings
+_fake_finding 1  pass "FileVault is OFF"
+_fake_finding 22 pass "Auto-login is ENABLED"
+evaluate_attack_chains
+assert_eq "a passing check never contributes to a chain" "0" "${#CHAIN_TITLES[@]}"
+
+_reset_findings
+_fake_finding 1 critical "FileVault is OFF"
+evaluate_attack_chains
+assert_eq "half a chain fires nothing" "0" "${#CHAIN_TITLES[@]}"
+
+_reset_findings
+_fake_finding 1 critical "FileVault is OFF"
+if has_finding 1 "FileVault is OFF" \
+   && ! has_finding 1 "Gatekeeper is DISABLED" \
+   && ! has_finding 2 "FileVault is OFF"; then
+    ok "has_finding matches on both the check number and the summary"
+else
+    bad "has_finding matches on both the check number and the summary"
+fi
+_reset_findings
+
 ###############################################################################
 group "Report output"
 ###############################################################################
@@ -428,6 +604,80 @@ else
     JSON_BODY=$(cat "$JSON")
     assert_contains "JSON report has a findings array" '"findings": [' "$JSON_BODY"
     assert_contains "JSON report redacts the serial" '"serial": "REDACTED"' "$JSON_BODY"
+fi
+
+# ── --baseline, end to end ───────────────────────────────────────────
+# The JSON just written becomes the baseline for a second, identical run. Same
+# machine, seconds apart: the diff must be empty. A tool that reports phantom
+# changes against its own output is worse than no diff at all.
+DIFF_MD="$WORK/diff.md"
+"$AUDIT" --category encryption,auth --redact --no-color \
+    --baseline "$JSON" --output "$DIFF_MD" >/dev/null 2>&1
+DIFF_BODY=$(cat "$DIFF_MD")
+assert_contains "--baseline adds a Changes Since Baseline section" \
+    "## Changes Since Baseline" "$DIFF_BODY"
+assert_contains "an identical baseline reports no change" \
+    "No change" "$DIFF_BODY"
+assert_contains "the diff says it does not affect the score" \
+    "does not affect the score" "$DIFF_BODY"
+
+# The score and the exit code must be identical with and without --baseline.
+# A diff that moved either one would make the grade depend on the age of a file.
+BASE_RUN=$("$AUDIT" --category encryption,auth --redact --quiet --output "$WORK/nb.md" 2>&1)
+BASE_RC=$?
+DIFF_RUN=$("$AUDIT" --category encryption,auth --redact --quiet \
+    --baseline "$JSON" --output "$WORK/wb.md" 2>&1)
+DIFF_RC=$?
+assert_eq "--baseline does not change the grade" "$BASE_RUN" "$DIFF_RUN"
+assert_eq "--baseline does not change the exit code" "$BASE_RC" "$DIFF_RC"
+
+DIFF_JSON="$WORK/diff.json"
+"$AUDIT" --category encryption,auth --json --redact \
+    --baseline "$JSON" --output "$DIFF_JSON" >/dev/null 2>&1
+if command -v python3 >/dev/null 2>&1; then
+    if PY_ERR=$(python3 - "$DIFF_JSON" "$JSON" <<'PY' 2>&1
+import json, sys
+d = json.load(open(sys.argv[1]))
+errs = []
+if not isinstance(d.get("attack_chains"), list):
+    errs.append("attack_chains must always be an array")
+b = d.get("baseline")
+if not isinstance(b, dict):
+    errs.append("baseline must be an object when --baseline is passed")
+else:
+    if b["file"] != sys.argv[2]:
+        errs.append("baseline.file %r != %r" % (b["file"], sys.argv[2]))
+    for key in ("timestamp", "score", "grade", "new", "resolved"):
+        if key not in b:
+            errs.append("baseline missing %s" % key)
+    if b.get("new") or b.get("resolved"):
+        errs.append("identical baseline produced a non-empty diff: %r" % b)
+print("\n".join(errs), end="")
+PY
+    ); then
+        assert_empty "JSON baseline object is well formed and the diff is empty" "$PY_ERR"
+    else
+        bad "JSON baseline object is well formed and the diff is empty" "$PY_ERR"
+    fi
+
+    # Without --baseline the key must still exist, as null — a consumer should
+    # not have to guess whether a missing key means "no diff" or "old version".
+    if PY_ERR=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+errs = []
+if "baseline" not in d or d["baseline"] is not None:
+    errs.append("baseline should be null without --baseline, got %r" % d.get("baseline"))
+if d.get("attack_chains") != []:
+    errs.append("attack_chains should be [] when no chain fires, got %r" % d.get("attack_chains"))
+print("\n".join(errs), end="")
+' "$JSON" 2>&1); then
+        assert_empty "JSON carries baseline:null and attack_chains:[] by default" "$PY_ERR"
+    else
+        bad "JSON carries baseline:null and attack_chains:[] by default" "$PY_ERR"
+    fi
+else
+    skip "python3 not installed — baseline JSON shape"
 fi
 
 ###############################################################################

@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 MSA_LIB_MODE="${MSA_LIB_MODE:-0}"
 
 # ── Colours / symbols for terminal output ────────────────────────────
@@ -102,6 +102,12 @@ CHECKS=(
     "40|auth|Password Policy|check_auth_password_policy"
     "41|privacy|Privacy Permissions (TCC)|check_privacy_tcc"
     "42|software|Safari Privacy & Security|check_software_safari_privacy"
+    "43|system|Trusted Root Certificates|check_system_trusted_roots"
+    "44|software|Startup & Login Items|check_software_startup_items"
+    "45|software|Shell Startup Files|check_software_shell_rc"
+    "46|auth|Sudo Configuration|check_auth_sudoers"
+    "47|auth|Login Authorization Plugins|check_auth_authplugins"
+    "48|software|Browser Extensions|check_software_browser_extensions"
 )
 
 TOTAL_CHECKS=${#CHECKS[@]}
@@ -170,6 +176,8 @@ OPTIONS:
     --json            Output report as JSON instead of Markdown
     --category CAT    Run only checks in given categories (comma-separated)
                       Categories: $(IFS=,; printf '%s' "${CATEGORIES[*]}")
+    --baseline FILE   Compare against a previous --json report and report what
+                      changed. Does not affect the score or the exit code.
     --quiet           Suppress terminal output, print only the grade
     --no-color        Disable ANSI color codes in terminal output
     --redact          Mask the hardware serial number in the report
@@ -204,6 +212,7 @@ EX_USAGE=64
 DATE_STAMP=$(date +%Y-%m-%d)
 OUTPUT_FILE=""
 SHOW_FIX=false
+BASELINE_FILE=""
 
 die_usage() {
     printf '%berror:%b %s\n' "$RED" "$NC" "$1" >&2
@@ -244,6 +253,15 @@ while [[ $# -gt 0 ]]; do
             fi
             [[ -n "$OUTPUT_FILE" ]] || die_usage "--output requires a non-empty FILE argument"
             ;;
+        --baseline)
+            if $has_optval; then
+                BASELINE_FILE="$optval"; shift
+            else
+                [[ $# -ge 2 ]] || die_usage "--baseline requires a FILE argument"
+                BASELINE_FILE="$2"; shift 2
+            fi
+            [[ -n "$BASELINE_FILE" ]] || die_usage "--baseline requires a non-empty FILE argument"
+            ;;
         --category)
             if $has_optval; then
                 CATEGORY_FILTER="$optval"; shift
@@ -277,6 +295,16 @@ if [[ -n "$CATEGORY_FILTER" ]]; then
     done
     [[ -n "$_valid" ]] || die_usage "--category requires at least one category"
     CATEGORY_FILTER="$_valid"
+fi
+
+# ── Validate --baseline ──────────────────────────────────────────────
+# Checked before the audit runs, not after: finding out that the baseline was a
+# typo is worth 40 seconds of someone's time.
+if [[ -n "$BASELINE_FILE" && "$MSA_LIB_MODE" != "1" ]]; then
+    [[ -e "$BASELINE_FILE" ]] || die_usage "baseline file does not exist: $BASELINE_FILE"
+    [[ -f "$BASELINE_FILE" && -r "$BASELINE_FILE" ]] || die_usage "baseline file is not a readable file: $BASELINE_FILE"
+    grep -q '"findings"' "$BASELINE_FILE" 2>/dev/null \
+        || die_usage "baseline file is not a macos-security-audit JSON report (run with --json to produce one): $BASELINE_FILE"
 fi
 
 # Set default output file based on mode
@@ -382,7 +410,7 @@ show_fix() {
         fix_text="${fix_text}"$'\n'"${cmd}"
     done
     if (( ${#F_FIX[@]} > 0 )); then
-        F_FIX[$(( ${#F_FIX[@]} - 1 ))]="$fix_text"
+        F_FIX[${#F_FIX[@]} - 1]="$fix_text"
     fi
     if $SHOW_FIX && ! $QUIET_MODE; then
         echo ""
@@ -451,6 +479,184 @@ letter_grade() {
     fi
 }
 
+# ── Baseline comparison (--baseline) ─────────────────────────────────
+# One audit tells you the state of the machine. Two audits tell you what
+# changed since — a listening port that was not there last week, a root CA that
+# appeared overnight, SIP that got turned off and nobody said so.
+#
+# The diff never moves the score and never changes the exit code. "This appeared
+# since Tuesday" is a fact about time, not about how hardened the machine is
+# right now, and a score that drifts with the age of the baseline file would be
+# meaningless. The audit result stands on its own; the diff sits beside it.
+#
+# Both sides are reduced to one line per finding — "<check>|<severity>|<summary>"
+# — with passes excluded, because a check flipping from fail to pass shows up as
+# the failure disappearing and does not need to be listed twice. Comparison
+# happens in JSON-escaped form on both sides so that a summary containing a
+# quote compares equal to itself; unescaping is done only for display.
+
+# Escapes are undone in one left-to-right pass. Doing it as a sequence of
+# substitutions would turn a literal backslash-n in a path into a newline.
+json_unescape() {
+    local s="$1" out="" c
+    while [[ -n "$s" ]]; do
+        c="${s:0:1}"
+        if [[ "$c" == "\\" && -n "${s:1:1}" ]]; then
+            case "${s:1:1}" in
+                n) out="${out}"$'\n' ;;
+                t) out="${out}"$'\t' ;;
+                r) out="${out}"$'\r' ;;
+                *) out="${out}${s:1:1}" ;;
+            esac
+            s="${s:2}"
+        else
+            out="${out}${c}"
+            s="${s:1}"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+# render_json writes each finding on a single line, which is what makes this a
+# sed expression instead of a JSON parser the tool is not allowed to depend on.
+# The anchors are the field names either side of the value, and every one of
+# them would have been escaped had it appeared inside a string.
+baseline_findings() {
+    sed -n 's/.*"check_number":\([0-9][0-9]*\),.*"severity":"\([a-z]*\)","summary":"\(.*\)","detail":".*/\1|\2|\3/p' "$1" 2>/dev/null \
+        | grep -v '|pass|' || true
+}
+
+# A --category run must not report every unrun check as "resolved". The baseline
+# is filtered through the same predicate the audit itself used.
+baseline_findings_active() {
+    local line num
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        num="${line%%|*}"
+        should_run_check "$num" && printf '%s\n' "$line"
+    done < <(baseline_findings "$1")
+    return 0
+}
+
+current_findings() {
+    local i
+    for (( i = 0; i < ${#F_SEV[@]}; i++ )); do
+        [[ "${F_SEV[$i]}" == "pass" ]] && continue
+        printf '%s|%s|%s\n' "${F_NUM[$i]}" "${F_SEV[$i]}" "$(json_escape "${F_SUMMARY[$i]}")"
+    done
+}
+
+# Top-level scalars only — score, grade, timestamp. render_json indents them by
+# exactly two spaces; anything nested under "machine" or "summary" is deeper and
+# is deliberately out of reach of this pattern.
+baseline_meta() {
+    sed -n "s/^  \"$2\": \"\{0,1\}\([^\",]*\)\"\{0,1\},\{0,1\}\$/\1/p" "$1" 2>/dev/null | head -1
+}
+
+# "12|high|External IPs found in /etc/hosts" → "[12] HIGH  External IPs …"
+format_diff_line() {
+    local line="$1" num sev summary
+    num="${line%%|*}"
+    line="${line#*|}"
+    sev="${line%%|*}"
+    summary="${line#*|}"
+    printf '[%s] %s  %s' "$num" "$(tr '[:lower:]' '[:upper:]' <<< "$sev")" "$(json_unescape "$summary")"
+}
+
+diff_line_field() {
+    local line="$1"
+    case "$2" in
+        num)     printf '%s' "${line%%|*}" ;;
+        sev)     line="${line#*|}"; printf '%s' "${line%%|*}" ;;
+        summary) line="${line#*|}"; printf '%s' "${line#*|}" ;;
+    esac
+}
+
+declare -a BASELINE_NEW=() BASELINE_GONE=()
+BASELINE_SCORE=""
+BASELINE_GRADE=""
+BASELINE_TIMESTAMP=""
+
+# ── Attack chains ────────────────────────────────────────────────────
+# Some findings are worse together than apart. FileVault off is bad and
+# auto-login is bad, but the two together mean whoever picks the machine up is
+# at your desktop, and whoever pulls the drive out reads it on their own — both
+# barriers gone at once. Scoring each check in isolation has no way to say that.
+#
+# A chain deducts nothing. Every component has already cost the score what it
+# costs, and charging twice for the same two findings would make the grade
+# depend on how many chains happen to have been written down. What a chain
+# changes is the order you fix things in, which is the part the severity column
+# was never able to tell you.
+#
+# Each chain keys on the exact summary text of the findings it combines, so a
+# chain can only fire on a finding that was actually recorded.
+
+declare -a CHAIN_TITLES=() CHAIN_BODIES=()
+
+has_finding() {
+    local want_num="$1" want_sub="$2" i
+    for (( i = 0; i < ${#F_NUM[@]}; i++ )); do
+        [[ "${F_NUM[$i]}" == "$want_num" ]] || continue
+        [[ "${F_SEV[$i]}" == "pass" ]] && continue
+        case "${F_SUMMARY[$i]}" in
+            *"$want_sub"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+add_chain() {
+    CHAIN_TITLES+=("$1")
+    CHAIN_BODIES+=("$2")
+}
+
+evaluate_attack_chains() {
+    if has_finding 1 "FileVault is OFF" && has_finding 22 "Auto-login is ENABLED"; then
+        add_chain "Unencrypted disk, and no password at boot" \
+"FileVault is off (check 1) and auto-login is on (check 22). Powering the Mac on lands
+straight at your desktop with nothing typed, and pulling the drive out gives the same
+data to any other machine. The two findings remove the two different barriers, so
+neither one is a fallback for the other.
+Fix FileVault first: it is the one that still protects the data when the Mac is off."
+    fi
+
+    if has_finding 16 "Remote Login (SSH) is enabled" && has_finding 10 "Firewall is DISABLED"; then
+        add_chain "SSH is listening and nothing is filtering it" \
+"SSH is accepting connections (check 16) and the application firewall is off (check 10).
+On a home network that is one exposed service; on café or hotel Wi-Fi it is one reachable
+from every other device on the segment, with no per-application rule in the way.
+Turning the firewall on is the smaller change of the two and does not cost you SSH."
+    fi
+
+    if has_finding 3 "SIP is DISABLED" && has_finding 4 "Gatekeeper is DISABLED"; then
+        add_chain "Nothing checks what runs, and nothing protects the system once it does" \
+"SIP is off (check 3) and Gatekeeper is off (check 4). Gatekeeper is what stops unsigned
+code from running in the first place; SIP is what stops code that is already running from
+modifying the system itself. With both off, an unsigned binary launched by accident can
+write to system locations and persist there.
+Gatekeeper is re-enabled in seconds and does not require a reboot; SIP does."
+    fi
+
+    if has_finding 43 "trusted as a root CA" && has_finding 12 "External/production IPs found in /etc/hosts"; then
+        add_chain "A trusted root CA plus hardcoded infrastructure addresses" \
+"A certificate is trusted as a root CA (check 43) and /etc/hosts pins hostnames to
+non-local IPs (check 12). Whoever holds that CA key can issue a certificate for any
+hostname your Mac trusts, and /etc/hosts already documents which hostnames are worth
+issuing one for and where they point.
+Neither is a compromise on its own. Together they are a map plus the key to use it."
+    fi
+
+    if has_finding 33 "mkcert root CA key has loose permissions" && has_finding 43 "trusted as a root CA"; then
+        add_chain "The trusted CA's private key is readable" \
+"mkcert's root CA private key has permissions wider than 600 (check 33), and a
+certificate is trusted as a root CA on this machine (check 43). Any process running as
+your user — a dependency in a build script included — can read that key and mint a
+certificate this Mac will accept for any domain, with no warning shown.
+Tighten the key to 600. If mkcert is no longer in use, 'mkcert -uninstall' removes the CA."
+    fi
+}
+
 # ── Helpers ──────────────────────────────────────────────────────────
 cmd_exists()  { command -v "$1" &>/dev/null; }
 daemon_loaded() { launchctl list "$1" &>/dev/null; }
@@ -496,6 +702,76 @@ firewall_state() {
         *enabled*)  printf '1' ;;
         *)          printf 'unknown' ;;
     esac
+}
+
+# `security dump-trust-settings` prints a Result Type per policy, and only two
+# of them grant trust — in very different amounts:
+#     kSecTrustSettingsResultTrustRoot   this certificate is a CA, so every
+#                                        certificate it signs is trusted too
+#     kSecTrustSettingsResultTrustAsRoot this one certificate is trusted, and
+#                                        nothing it signs inherits that
+#     kSecTrustSettingsResultDeny        explicitly distrusted — a *good* setting
+#     kSecTrustSettingsResultUnspecified no override; the system default applies
+# Deny is the one setting here that improves security, so reporting it as a risk
+# would flag exactly the wrong thing. The mapping is explicit and anything
+# unrecognised stays "other" rather than being assumed to grant trust.
+#     (no Result Type line)         the user domain prints trust settings with
+#                                   no Result Type at all — observed on macOS 26
+# Deny is the one setting here that improves security, so reporting it as a risk
+# would flag exactly the wrong thing. A missing Result Type is reported as
+# "unstated" rather than assumed: Apple documents an absent value as defaulting
+# to TrustRoot, but this tool has not confirmed that on a live certificate, and
+# guessing that something grants root trust is how a false alarm gets written.
+trust_result_risk() {
+    case "$1" in
+        "")           printf 'unstated' ;;
+        none)         printf 'none' ;;
+        *TrustAsRoot) printf 'leaf' ;;
+        *TrustRoot)   printf 'root' ;;
+        *Deny)        printf 'deny' ;;
+        *Unspecified) printf 'unspecified' ;;
+        *)            printf 'other' ;;
+    esac
+}
+
+# A certificate carries one trust setting per policy, and they can disagree —
+# SSL denied, S/MIME trusted as a root. Ranking them lets the strongest win, so
+# a certificate is never described by whichever setting happened to be parsed
+# last. Higher rank = more trust granted.
+trust_risk_rank() {
+    case "$1" in
+        root)        printf '5' ;;
+        leaf)        printf '4' ;;
+        deny)        printf '3' ;;
+        unspecified) printf '2' ;;
+        unstated)    printf '1' ;;
+        *)           printf '0' ;;   # 'none' and anything unrecognised
+    esac
+}
+
+# Mechanisms in the login authorization chain are "<provider>:<name>[,privileged]".
+# Everything Apple ships uses one of these providers; a third-party plugin appears
+# under its own bundle name. A mechanism in this chain runs inside the login
+# window — the process the password is typed into — so an unexpected provider is
+# worth reading even when the bundle is signed.
+APPLE_LOGIN_PROVIDERS=(builtin loginwindow PKINITMechanism HomeDirMechanism MCXMechanism CryptoTokenKit)
+
+login_mechanism_is_apple() {
+    local provider="${1%%:*}" known
+    for known in "${APPLE_LOGIN_PROVIDERS[@]}"; do
+        [[ "$provider" == "$known" ]] && return 0
+    done
+    return 1
+}
+
+# A shell startup file runs on every new terminal, so anyone who can write to it
+# gets code execution as you. The mode comes from stat as octal digits and the
+# two write bits are tested arithmetically — string-matching a 9-character
+# listing is how "-rw-rw-r--" and "-rw-r--rw-" end up treated the same.
+mode_is_group_or_world_writable() {
+    local mode="$1"
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 8#022) != 0 ))
 }
 
 # ── Spinner ──────────────────────────────────────────────────────────
@@ -953,7 +1229,7 @@ Fix: System Settings > Network > Wi-Fi > Details > DNS > add 1.1.1.1 and 1.0.0.1
 
     HOSTS_EXTERNAL=$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' /etc/hosts 2>/dev/null | grep -v '127.0.0.1\|255.255.255.255\|0.0.0.0' || true)
     if [[ -n "$HOSTS_EXTERNAL" ]]; then
-        HOST_LIST=$(echo "$HOSTS_EXTERNAL" | sed 's/^/  /')
+        HOST_LIST="  ${HOSTS_EXTERNAL//$'\n'/$'\n'  }"
         high "External/production IPs found in /etc/hosts" \
 "Your /etc/hosts contains non-local IP addresses. Anyone with access to your machine can see your infrastructure layout:
 
@@ -969,7 +1245,11 @@ Fix: Remove production IPs from /etc/hosts. Use a VPN + private DNS instead.
     fi
 
     VPN_CONNS=$(scutil --nc list 2>/dev/null | grep -v "^Available\|^$" || true)
-    VPN_PROCS=$(ps aux 2>/dev/null | grep -iE "openvpn|wireguard|privateinternet|pia|viscosity|mullvad|nordvpn" | grep -v grep || true)
+    # pgrep rather than `ps | grep`: it matches the full command line the same
+    # way, and it does not need the `grep -v grep` that exists only to filter out
+    # the pipeline's own process. Nothing here reads the PIDs — the result is
+    # tested for emptiness and never acted on.
+    VPN_PROCS=$(pgrep -if "openvpn|wireguard|privateinternet|pia|viscosity|mullvad|nordvpn" 2>/dev/null || true)
     if [[ -n "$VPN_PROCS" ]]; then
         pass "VPN process detected as running"
     elif [[ -n "$VPN_CONNS" ]]; then
@@ -1282,7 +1562,7 @@ Fix: System Settings > Users & Groups > demote unnecessary admins to Standard
     if echo "$SCREENLOCK_STATUS" | grep -qi "immediate"; then
         pass "Screen lock requires password immediately"
     elif echo "$SCREENLOCK_STATUS" | grep -qi "screenLock delay"; then
-        DELAY_INFO=$(echo "$SCREENLOCK_STATUS" | sed 's/.*screenLock delay is //')
+        DELAY_INFO="${SCREENLOCK_STATUS##*screenLock delay is }"
         medium "Screen lock delay is: ${DELAY_INFO}" \
 "An attacker with brief physical access could unlock the machine within the grace window.
 
@@ -1803,7 +2083,7 @@ Fix: Uninstall any you're not actively using. Keep them in a VM if needed for se
     done
     THIRD_PARTY_DAEMONS=$(printf '%b' "$THIRD_PARTY_DAEMONS")
     if [[ -n "$THIRD_PARTY_DAEMONS" ]]; then
-        DAEMON_LIST=$(echo "$THIRD_PARTY_DAEMONS" | sed 's/^/  - /')
+        DAEMON_LIST="  - ${THIRD_PARTY_DAEMONS//$'\n'/$'\n'  - }"
 
         if echo "$THIRD_PARTY_DAEMONS" | grep -qi "teamviewer"; then
             critical "TeamViewer LaunchDaemons are installed" \
@@ -2327,14 +2607,595 @@ Fix: Safari > Settings > Privacy > enable tracking prevention
 }
 
 ###############################################################################
+# CHECKS — trust, persistence and third-party code (added in v3.1.0)
+###############################################################################
+
+# A certificate you told macOS to trust can impersonate any site on the
+# internet, and nothing in the browser UI says so — the padlock looks the same.
+# Development tooling installs these routinely (mkcert, Charles, mitmproxy,
+# Proxyman) and uninstalling the tool does not remove the certificate.
+check_system_trusted_roots() {
+    local domain flag out lines idx name rt risk key j found
+    local -a CERT_KEY=() CERT_NAME=() CERT_RISK=()
+    local roots=0 others=0 denies=0 listing="" root_names="" other_names=""
+
+    # Two domains are read: admin (system-wide, changing it needs an admin
+    # password) and user (this login only). The *system* domain is Apple's
+    # shipped root store — 150-odd certificates that are supposed to be there —
+    # so enumerating it would bury the four that someone actually added.
+    for domain in admin user; do
+        if [[ "$domain" == "admin" ]]; then flag="-d"; else flag=""; fi
+        # No trust settings at all is an error exit, not an empty success.
+        out=$(security dump-trust-settings $flag 2>/dev/null || true)
+        [[ -z "$out" ]] && continue
+
+        # A cert line is emitted even when the certificate has no Result Type,
+        # so a certificate can never drop out of the report just because macOS
+        # printed its trust settings in the shorter form.
+        lines=$(printf '%s\n' "$out" | awk '
+            /^Cert [0-9]+:/ { idx = $2; sub(/:$/, "", idx); name = $0; sub(/^Cert [0-9]+: /, "", name); next }
+            /Number of trust settings/ {
+                if (name == "") next
+                if ($NF == "0") print idx "|" name "|none"      # listed, but nothing customised
+                else            print idx "|" name "|"          # placeholder; a Result Type may follow
+            }
+            /Result Type/   { if (name != "") print idx "|" name "|" $NF }
+        ')
+        [[ -z "$lines" ]] && continue
+
+        while IFS='|' read -r idx name rt; do
+            [[ -z "$idx" ]] && continue
+            key="${domain}/${idx}"
+            risk=$(trust_result_risk "$rt")
+            found=-1
+            for (( j = 0; j < ${#CERT_KEY[@]}; j++ )); do
+                if [[ "${CERT_KEY[$j]}" == "$key" ]]; then found=$j; break; fi
+            done
+            if (( found < 0 )); then
+                CERT_KEY+=("$key"); CERT_NAME+=("$name"); CERT_RISK+=("$risk")
+            elif (( $(trust_risk_rank "$risk") > $(trust_risk_rank "${CERT_RISK[found]}") )); then
+                CERT_RISK[found]="$risk"
+            fi
+        done <<< "$lines"
+    done
+
+    for (( j = 0; j < ${#CERT_KEY[@]}; j++ )); do
+        domain="${CERT_KEY[$j]%%/*}"
+        case "${CERT_RISK[$j]}" in
+            root)
+                roots=$((roots + 1))
+                root_names="${root_names}  - ${CERT_NAME[$j]} (${domain} domain) — trusted as a root CA\n"
+                listing="${listing}  - ${CERT_NAME[$j]} (${domain})  <-- trusted as a root CA\n" ;;
+            leaf)
+                others=$((others + 1))
+                other_names="${other_names}  - ${CERT_NAME[$j]} (${domain} domain) — trusted as a single certificate\n"
+                listing="${listing}  - ${CERT_NAME[$j]} (${domain})  <-- trusted as a single certificate\n" ;;
+            unstated)
+                others=$((others + 1))
+                other_names="${other_names}  - ${CERT_NAME[$j]} (${domain} domain) — custom trust settings, result type not stated\n"
+                listing="${listing}  - ${CERT_NAME[$j]} (${domain})  <-- custom trust settings\n" ;;
+            deny)
+                denies=$((denies + 1))
+                listing="${listing}  - ${CERT_NAME[$j]} (${domain})  (explicitly distrusted)\n" ;;
+            *)
+                # 'none' — the certificate is in the keychain and shows up in the
+                # dump, but has no custom trust settings at all. Listed, because
+                # a duplicate of a CA you did trust is worth seeing, and not
+                # counted, because nothing was customised.
+                listing="${listing}  - ${CERT_NAME[$j]} (${domain})  (no custom trust settings)\n" ;;
+        esac
+    done
+
+    if (( roots > 0 )); then
+        high "$(printf '%d certificate(s) are trusted as a root CA' "$roots")" \
+"Whoever holds the private key for one of these certificates can issue a valid
+certificate for any domain — your bank, your company SSO, anything — and your
+Mac will accept it silently. No browser warning appears, because from macOS's
+point of view the certificate really is trusted.
+
+$(printf '%b' "$root_names")
+This is normal on a development machine (mkcert, Charles Proxy, mitmproxy and
+Proxyman all install one) and it is also exactly what a working man-in-the-middle
+looks like. The question worth answering for each one is: did you install it,
+is the tool still in use, and is its private key still on this disk?
+
+Review or remove them in Keychain Access > System (or Login) > Certificates:
+select the certificate, open Get Info, and set 'When using this certificate'
+back to 'Use System Defaults', or delete it outright. mkcert's own CA can be
+removed with 'mkcert -uninstall'."
+        # Breakdown after the summary, before the fix block — the fix commands
+        # belong at the end, not wedged between a finding and its evidence.
+        qprint "%b" "${listing//  - /          - }"
+        show_fix "List the certificates you have trusted, then review them" \
+            "security dump-trust-settings -d" \
+            "security dump-trust-settings" \
+            "open -a 'Keychain Access'"
+    elif (( others > 0 )); then
+        medium "$(printf '%d certificate(s) have custom trust settings' "$others")" \
+"None of these is trusted as a certificate authority, so the damage is bounded:
+the exact certificate is accepted and nothing it signs inherits that trust.
+Still worth knowing about — self-signed localhost and staging certificates end
+up here and outlive the project that needed them.
+
+$(printf '%b' "$other_names")
+Where the result type is 'not stated', macOS printed the trust settings without
+one. That is the shorter form the user domain uses; it means a custom setting
+exists, and Keychain Access will show you which.
+
+Review them in Keychain Access > Certificates > Get Info > 'When using this
+certificate' > 'Use System Defaults'."
+        qprint "%b" "${listing//  - /          - }"
+        show_fix "List certificates with custom trust settings" \
+            "security dump-trust-settings -d" \
+            "security dump-trust-settings"
+    elif (( denies > 0 )); then
+        pass "$(printf 'No certificates are manually trusted (%d explicitly distrusted)' "$denies")"
+    else
+        pass "No certificates are manually trusted"
+    fi
+}
+
+# LaunchAgents in /Library run at login for *every* account on the Mac, not just
+# yours — check 33 covers ~/Library/LaunchAgents, which is a different set.
+# Login and logout hooks are a deprecated mechanism that still works, runs as
+# root, and appears nowhere in System Settings.
+check_software_startup_items() {
+    local agents agent count=0 unknown_count=0 unknown_list="" listing="" domain hook value
+    local hooks=""
+
+    agents=$(find /Library/LaunchAgents -maxdepth 1 -type f -name '*.plist' 2>/dev/null | awk -F/ '{print $NF}' | sort || true)
+
+    if [[ -n "$agents" ]]; then
+        while IFS= read -r agent; do
+            [[ -z "$agent" ]] && continue
+            count=$((count + 1))
+            # Every agent is listed; the whitelist decides the severity, not what
+            # you are allowed to see.
+            if is_known_agent "$agent"; then
+                listing="${listing}          - ${agent}\n"
+            else
+                unknown_count=$((unknown_count + 1))
+                unknown_list="${unknown_list}  - ${agent}\n"
+                listing="${listing}          - ${agent}  <-- unknown\n"
+            fi
+        done <<< "$agents"
+    fi
+
+    # Both the per-user domain and the machine-wide plist, because a hook set in
+    # either one runs. The value is the path to a script; it is reported, since
+    # the whole point of the finding is to say which script.
+    for domain in com.apple.loginwindow /Library/Preferences/com.apple.loginwindow; do
+        for hook in LoginHook LogoutHook; do
+            value=$(defaults read "$domain" "$hook" 2>/dev/null || true)
+            [[ -n "$value" ]] && hooks="${hooks}  - ${hook} (${domain}): ${value}\n"
+        done
+    done
+
+    if [[ -n "$hooks" ]]; then
+        high "Login/logout hook is configured" \
+"A login hook is a script macOS runs as root every time someone logs in. Apple
+deprecated the mechanism years ago and it appears in no System Settings pane, so
+it is a comfortable place to hide: nobody looks there, and it survives reboots
+and account changes.
+
+$(printf '%b' "$hooks")
+If you did not set this up deliberately, read the script before doing anything
+else. Removing a hook is 'sudo defaults delete com.apple.loginwindow LoginHook'."
+        show_fix "Inspect and remove the hook" \
+            "defaults read com.apple.loginwindow LoginHook" \
+            "sudo defaults delete com.apple.loginwindow LoginHook" \
+            "sudo defaults delete com.apple.loginwindow LogoutHook"
+    elif (( unknown_count > 0 )); then
+        medium "$(printf '%d unrecognised system-wide LaunchAgent(s) (%d total)' "$unknown_count" "$count")" \
+"These live in /Library/LaunchAgents and start automatically at login for every
+account on this Mac, which is a wider reach than the per-user agents in check 33.
+
+$(printf '%b' "$unknown_list")
+Unrecognised does not mean malicious — the list of known-good agents in this tool
+is short and most legitimate software is missing from it. Read each plist to see
+what it launches: 'defaults read /Library/LaunchAgents/<name>.plist ProgramArguments'.
+
+Not covered here: modern background items registered through SMAppService
+(System Settings > General > Login Items & Extensions). Reading that database
+requires root, and this tool never asks for it."
+        qprint "%b" "$listing"
+        show_fix "See what each agent launches" \
+            "ls -la /Library/LaunchAgents/" \
+            "defaults read /Library/LaunchAgents/<name>.plist ProgramArguments"
+    elif (( count > 0 )); then
+        pass "$(printf '%d system-wide LaunchAgent(s), all recognised' "$count")"
+        qprint "%b" "$listing"
+    else
+        pass "No system-wide LaunchAgents and no login hooks"
+    fi
+}
+
+# Every new terminal window executes these files. Anyone who can write to one of
+# them gets code execution as you, every time, without a prompt.
+SHELL_RC_FILES=(
+    ".zshrc" ".zprofile" ".zshenv" ".zlogin" ".zlogout"
+    ".bashrc" ".bash_profile" ".bash_login" ".profile"
+)
+
+check_software_shell_rc() {
+    local f path mode writable="" suspicious="" checked=0
+
+    for f in "${SHELL_RC_FILES[@]}"; do
+        path="${HOME}/${f}"
+        [[ -f "$path" ]] || continue
+        checked=$((checked + 1))
+
+        mode=$(stat -f '%Lp' "$path" 2>/dev/null || true)
+        if mode_is_group_or_world_writable "$mode"; then
+            writable="${writable}  - ~/${f} (mode ${mode})\n"
+        fi
+
+        # Only the file name and which pattern matched are ever reported. The
+        # matching line is not printed and not stored: shell startup files are
+        # where people keep API tokens, and a security report that leaks one has
+        # made things worse.
+        if grep -qE "(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?[a-z]*sh" "$path" 2>/dev/null; then
+            suspicious="${suspicious}  - ~/${f} pipes a download directly into a shell\n"
+        fi
+        if grep -qE "base64[[:space:]]+(-d|-D|--decode)" "$path" 2>/dev/null; then
+            suspicious="${suspicious}  - ~/${f} decodes base64 at shell start\n"
+        fi
+    done
+
+    # System-wide files run before yours and are writable only by root; their
+    # permissions are the thing worth checking, not their contents.
+    for path in /etc/zshrc /etc/zprofile /etc/zshenv /etc/bashrc /etc/profile; do
+        [[ -f "$path" ]] || continue
+        checked=$((checked + 1))
+        mode=$(stat -f '%Lp' "$path" 2>/dev/null || true)
+        if mode_is_group_or_world_writable "$mode"; then
+            writable="${writable}  - ${path} (mode ${mode})\n"
+        fi
+    done
+
+    if [[ -n "$writable" ]]; then
+        high "Shell startup file is writable by group or others" \
+"A shell startup file runs on every new terminal. If someone other than you can
+write to it, they can run anything they like as you, silently, the next time you
+open a terminal — and it will keep running for as long as the line stays there.
+
+$(printf '%b' "$writable")
+Fix with 'chmod 644 <file>' for your own files (or 'chmod go-w <file>'). For the
+/etc files, this normally means something changed them during an install."
+        show_fix "Remove group/other write permission" \
+            "chmod go-w ~/.zshrc ~/.zprofile ~/.bash_profile" \
+            "ls -la ~/.zshrc ~/.zprofile ~/.zshenv ~/.bashrc ~/.bash_profile"
+    elif [[ -n "$suspicious" ]]; then
+        medium "Shell startup file runs a pattern worth reading" \
+"$(printf '%b' "$suspicious")
+Neither pattern is malicious by itself — plenty of install instructions end in
+'curl … | sh', and it is normal to keep one in a dotfile. Both are also how a
+startup file fetches and runs code you have never read, on every terminal.
+
+The matching line is deliberately not reproduced here, because these files
+routinely contain API tokens. Open the file and read the line yourself."
+        show_fix "Read the file and decide" \
+            "grep -nE '(curl|wget).*\\|' ~/.zshrc ~/.zprofile ~/.bash_profile"
+    elif (( checked > 0 )); then
+        pass "$(printf '%d shell startup file(s) look clean' "$checked")"
+    else
+        pass "No shell startup files found"
+    fi
+}
+
+# A NOPASSWD rule turns any code running as you into code running as root, with
+# no password prompt to notice. /etc/sudoers itself is mode 0440 root:wheel and
+# this tool never runs sudo, so only the drop-in directory is in reach — that is
+# stated in the finding rather than papered over.
+check_auth_sudoers() {
+    local drop_ins entry path nopasswd="" listing="" count=0 unreadable=0
+
+    if [[ -d /etc/sudoers.d ]]; then
+        drop_ins=$(find /etc/sudoers.d -maxdepth 1 -type f 2>/dev/null | awk -F/ '{print $NF}' | sort || true)
+    else
+        drop_ins=""
+    fi
+
+    if [[ -n "$drop_ins" ]]; then
+        while IFS= read -r entry; do
+            [[ -z "$entry" ]] && continue
+            count=$((count + 1))
+            path="/etc/sudoers.d/${entry}"
+            listing="${listing}  - ${entry}\n"
+            if [[ -r "$path" ]]; then
+                if grep -q "NOPASSWD" "$path" 2>/dev/null; then
+                    nopasswd="${nopasswd}  - ${entry}\n"
+                fi
+            else
+                unreadable=$((unreadable + 1))
+            fi
+        done <<< "$drop_ins"
+    fi
+
+    if [[ -n "$nopasswd" ]]; then
+        high "Passwordless sudo rule found in /etc/sudoers.d" \
+"A NOPASSWD rule means sudo runs without asking for a password. Anything that can
+run a command as you — a malicious npm postinstall, a compromised shell startup
+file, a script you piped from the internet — becomes root without you typing
+anything or seeing a prompt.
+
+$(printf '%b' "$nopasswd")
+Legitimate uses exist (CI runners, some installers). If you did not add it,
+remove it. Only the file name is shown here; read the rule yourself with
+'sudo cat /etc/sudoers.d/<name>' and edit it with 'sudo visudo -f'."
+        show_fix "Review the rule and remove it if unexpected" \
+            "sudo cat /etc/sudoers.d/<name>" \
+            "sudo visudo -f /etc/sudoers.d/<name>"
+    elif (( count > 0 )); then
+        medium "$(printf '%d file(s) in /etc/sudoers.d extend sudo rules' "$count")" \
+"Files dropped in this directory change who may run what as root, and installers
+put them there without asking.
+
+$(printf '%b' "$listing")
+$(if (( unreadable > 0 )); then printf '%d of them could not be read as a normal user, so their rules were not inspected. ' "$unreadable"; fi)Read them with 'sudo cat /etc/sudoers.d/<name>'.
+
+/etc/sudoers itself is only readable by root, so this check cannot see the main
+rule set — including a NOPASSWD line placed there directly."
+        show_fix "Read the drop-in rules" \
+            "ls -la /etc/sudoers.d/" \
+            "sudo cat /etc/sudoers.d/*"
+    else
+        pass "No custom sudo rules in /etc/sudoers.d"
+    fi
+}
+
+# The login authorization chain is a list of mechanisms macOS runs inside the
+# login window — the process the password is typed into. Enterprise tools
+# legitimately insert themselves here (JAMF Connect, NoMAD, Okta), and so does
+# anything that wants to see credentials in the clear.
+check_auth_authplugins() {
+    local mechs mech third_party="" bundles="" referenced="" listing="" plugin_dir
+    plugin_dir="/Library/Security/SecurityAgentPlugins"
+
+    mechs=$(security authorizationdb read system.login.console 2>/dev/null | awk '
+        /<key>mechanisms<\/key>/ { inarr = 1; next }
+        inarr && /<\/array>/     { exit }
+        inarr && match($0, /<string>.*<\/string>/) { print substr($0, RSTART + 8, RLENGTH - 17) }
+    ' || true)
+
+    if [[ -n "$mechs" ]]; then
+        while IFS= read -r mech; do
+            [[ -z "$mech" ]] && continue
+            login_mechanism_is_apple "$mech" || third_party="${third_party}  - ${mech}\n"
+        done <<< "$mechs"
+    fi
+
+    if [[ -d "$plugin_dir" ]]; then
+        bundles=$(find "$plugin_dir" -maxdepth 1 -name '*.bundle' 2>/dev/null | awk -F/ '{print $NF}' | sort || true)
+        if [[ -f "${plugin_dir}/Component.plist" ]]; then
+            referenced=$(awk 'match($0, /<string>.*\.bundle<\/string>/) { print substr($0, RSTART + 8, RLENGTH - 17) }' \
+                "${plugin_dir}/Component.plist" 2>/dev/null | sort -u || true)
+        fi
+    fi
+
+    [[ -n "$bundles"    ]] && listing="${listing}$(printf '%s\n' "$bundles"    | awk 'NF { print "  - " $0 " (installed)" }')"$'\n'
+    [[ -n "$referenced" ]] && listing="${listing}$(printf '%s\n' "$referenced" | awk 'NF { print "  - " $0 " (registered in Component.plist)" }')"$'\n'
+
+    if [[ -z "$mechs" ]]; then
+        # A failed query is not evidence of a plugin, and reporting it as one
+        # would be a false alarm.
+        medium "Could not read the login authorization chain" \
+"'security authorizationdb read system.login.console' returned nothing, so the
+list of mechanisms that run at the login window could not be checked. Run it by
+hand to see whether a third-party plugin is in the chain."
+        show_fix "Read the login authorization chain" \
+            "security authorizationdb read system.login.console"
+    elif [[ -n "$third_party" ]]; then
+        high "Third-party plugin is in the login authorization chain" \
+"These mechanisms run inside the login window, which is where the password is
+typed. A plugin there can see credentials in the clear.
+
+$(printf '%b' "$third_party")
+${listing:+Plugins on disk:
+${listing}}
+Enterprise identity tools (JAMF Connect, NoMAD, Okta Verify) belong here and are
+expected on a managed Mac. Anything else should be traced back to something you
+installed on purpose."
+        qprint "%b" "${third_party//  - /          - }"
+        show_fix "Inspect the chain and the plugin bundles" \
+            "security authorizationdb read system.login.console" \
+            "ls -la /Library/Security/SecurityAgentPlugins/"
+    elif [[ -n "$listing" ]]; then
+        medium "Authorization plugin(s) present but not in the login chain" \
+"$(printf '%b' "$listing")
+None of them appear in the mechanism list for system.login.console, so they do
+not run at login as things stand. A bundle registered in Component.plist while
+the bundle itself is gone is usually the residue of an uninstall — harmless, but
+it is also a re-armed slot if the bundle ever comes back."
+        qprint "%b" "${listing//  - /          - }"
+        show_fix "Inspect the plugin directory" \
+            "ls -la /Library/Security/SecurityAgentPlugins/" \
+            "security authorizationdb read system.login.console"
+    else
+        pass "Login authorization chain is stock Apple mechanisms only"
+    fi
+}
+
+# An extension with the right permissions reads every page you open, including
+# the ones behind your bank's login. These are the permissions that make that
+# possible; the common, low-signal ones (storage, alarms, contextMenus, and
+# declarativeNetRequest, which every content blocker uses) are left out so the
+# finding stays worth reading.
+HIGH_IMPACT_EXTENSION_PERMISSIONS=(
+    "<all_urls>" "debugger" "nativeMessaging" "proxy" "cookies"
+    "webRequest" "management" "history" "desktopCapture" "tabCapture"
+)
+
+CHROMIUM_PROFILE_ROOTS=(
+    "Google/Chrome" "Google/Chrome Beta" "Google/Chrome Canary" "Google/Chrome Dev"
+    "Chromium" "BraveSoftware/Brave-Browser" "Microsoft Edge" "Vivaldi"
+    "Arc/User Data" "Opera Software/Opera Stable"
+)
+
+check_software_browser_extensions() {
+    local base root dir ext_dirs manifest ext_id ext_name perm hits seen j
+    local msg_key msg_file default_locale locale
+    local -a roots=() seen_ids=()
+    local listing="" flagged="" count=0 flagged_count=0
+
+    base="${HOME}/Library/Application Support"
+    for root in "${CHROMIUM_PROFILE_ROOTS[@]}"; do
+        [[ -d "${base}/${root}" ]] && roots+=("${base}/${root}")
+    done
+
+    if (( ${#roots[@]} == 0 )); then
+        pass "No Chromium-family browser profiles found"
+        return
+    fi
+
+    # Two bounded finds rather than one deep one: browser support directories
+    # hold hundreds of thousands of cache files, and walking them would stall
+    # the audit for seconds with nothing to show for it.
+    ext_dirs=$(find "${roots[@]}" -maxdepth 3 -type d -name Extensions 2>/dev/null || true)
+    [[ -z "$ext_dirs" ]] && { pass "No browser extensions installed"; return; }
+
+    while IFS= read -r dir; do
+        [[ -z "$dir" ]] && continue
+        while IFS= read -r manifest; do
+            [[ -z "$manifest" ]] && continue
+
+            # <Extensions>/<id>/<version>/manifest.json
+            ext_id=$(printf '%s' "$manifest" | awk -F/ '{print $(NF-2)}')
+
+            # The same extension installed in two profiles, or two browsers, is
+            # one extension. Counting it twice would inflate every number in the
+            # finding.
+            seen=false
+            for (( j = 0; j < ${#seen_ids[@]}; j++ )); do
+                if [[ "${seen_ids[$j]}" == "$ext_id" ]]; then seen=true; break; fi
+            done
+            $seen && continue
+            seen_ids+=("$ext_id")
+            count=$((count + 1))
+
+            # Only a top-level "name" is used (indented at most four spaces);
+            # nested objects in a manifest have a "name" too, and a minified
+            # manifest has no usable indentation at all.
+            ext_name=$(awk '
+                { indent = match($0, /[^ ]/) - 1 }
+                indent <= 4 && match($0, /"name"[[:space:]]*:[[:space:]]*"/) {
+                    s = substr($0, RSTART + RLENGTH)
+                    sub(/".*$/, "", s)
+                    print s; exit
+                }
+            ' "$manifest" 2>/dev/null || true)
+
+            # A localised extension stores "__MSG_appName__" in the manifest and
+            # the real string in _locales. Without this, half the report is hex
+            # identifiers.
+            if [[ "$ext_name" == __MSG_*__ ]]; then
+                msg_key="${ext_name#__MSG_}"; msg_key="${msg_key%__}"
+                ext_name=""
+                # The extension's own default_locale first, then the two English
+                # spellings. Chrome ships an _locales/en that does not always
+                # contain the key — stopping at the first *existing* file leaves
+                # the name unresolved, so the loop stops at the first *answer*.
+                default_locale=$(awk '
+                    match($0, /"default_locale"[[:space:]]*:[[:space:]]*"/) {
+                        s = substr($0, RSTART + RLENGTH); sub(/".*$/, "", s); print s; exit
+                    }' "$manifest" 2>/dev/null || true)
+                for locale in "$default_locale" en_US en; do
+                    [[ -n "$locale" ]] || continue
+                    msg_file="${manifest%/manifest.json}/_locales/${locale}/messages.json"
+                    [[ -f "$msg_file" ]] || continue
+                    ext_name=$(awk -v key="\"${msg_key}\"" '
+                        { p = index($0, key) }
+                        p > 0 {
+                            rest = substr($0, p)
+                            if (match(rest, /"message"[[:space:]]*:[[:space:]]*"/)) {
+                                s = substr(rest, RSTART + RLENGTH); sub(/".*$/, "", s); print s; exit
+                            }
+                            found = 1; next
+                        }
+                        found && match($0, /"message"[[:space:]]*:[[:space:]]*"/) {
+                            s = substr($0, RSTART + RLENGTH); sub(/".*$/, "", s); print s; exit
+                        }
+                    ' "$msg_file" 2>/dev/null || true)
+                    [[ -n "$ext_name" ]] && break
+                done
+            fi
+            # Falling back to the extension ID is correct, not a failure: the ID
+            # is what chrome://extensions and the Web Store URL both use.
+            [[ -z "$ext_name" || "$ext_name" == __MSG_* ]] && ext_name="$ext_id"
+
+            hits=""
+            for perm in "${HIGH_IMPACT_EXTENSION_PERMISSIONS[@]}"; do
+                if grep -qF "\"${perm}\"" "$manifest" 2>/dev/null; then
+                    hits="${hits}${hits:+, }${perm}"
+                fi
+            done
+
+            if [[ -n "$hits" ]]; then
+                flagged_count=$((flagged_count + 1))
+                flagged="${flagged}  - ${ext_name} [${ext_id}] — ${hits}\n"
+                listing="${listing}  - ${ext_name}  <-- ${hits}\n"
+            else
+                listing="${listing}  - ${ext_name}\n"
+            fi
+        done <<< "$(find "$dir" -maxdepth 3 -type f -name manifest.json 2>/dev/null || true)"
+    done <<< "$ext_dirs"
+
+    if (( flagged_count > 0 )); then
+        medium "$(printf '%d of %d browser extension(s) declare high-impact permissions' "$flagged_count" "$count")" \
+"An extension with these permissions can read and modify the pages you visit,
+including your email and your bank. That is also what a legitimate password
+manager or ad blocker needs, so the permission itself is not the finding — the
+question is whether you recognise every extension in this list and still use it.
+
+$(printf '%b' "$flagged")
+The scan matches the permission string anywhere in manifest.json, so an optional
+or narrowly-scoped declaration is reported the same as a blanket one. Open the
+manifest to see the real scope, or the browser's own extension page, which shows
+it in plain language:
+  chrome://extensions  →  Details  →  'Site access' and 'Permissions'
+
+Not covered: Firefox (extensions are packed in .xpi archives) and Safari (its
+extensions are app bundles, listed under Safari > Settings > Extensions)."
+        qprint "%b" "${listing//  - /          - }"
+        show_fix "Review each extension in the browser" \
+            "open -a 'Google Chrome' chrome://extensions" \
+            "ls -1 \$HOME/Library/Application\\ Support/Google/Chrome/*/Extensions"
+    elif (( count > 0 )); then
+        pass "$(printf '%d browser extension(s), none declaring high-impact permissions' "$count")"
+        qprint "%b" "${listing//  - /          - }"
+    else
+        pass "No browser extensions installed"
+    fi
+}
+
+###############################################################################
 # REPORT RENDERERS
 ###############################################################################
 
 # Markdown table cells must not contain a bare pipe.
 md_cell() { printf '%s' "${1//|/\\|}"; }
 
+# Renders   "new": [{"check_number":12,"severity":"high","summary":"…"}]
+# from the "<check>|<severity>|<summary>" lines the diff produces. The summary
+# arrives already JSON-escaped — that is the form it was compared in — so it is
+# emitted verbatim rather than escaped a second time.
+render_json_diff_array() {
+    local key="$1" line first=true
+    shift
+    printf '    "%s": [' "$key"
+    for line in "$@"; do
+        $first || printf ','
+        first=false
+        printf '{"check_number":%d,"severity":"%s","summary":"%s"}' \
+            "$(diff_line_field "$line" num)" \
+            "$(diff_line_field "$line" sev)" \
+            "$(diff_line_field "$line" summary)"
+    done
+    printf ']'
+}
+
 render_json() {
-    local i n fix_json
+    local i n c cn fix_json
     n=${#F_SEV[@]}
     printf '{\n'
     printf '  "version": "%s",\n' "$VERSION"
@@ -2363,6 +3224,32 @@ render_json() {
     printf '    "checks_run": %d,\n' "$CHECKS_RUN"
     printf '    "total": %d\n' "$ACTIVE_CHECKS"
     printf '  },\n'
+    printf '  "attack_chains": [\n'
+    cn=${#CHAIN_TITLES[@]}
+    for (( c = 0; c < cn; c++ )); do
+        printf '    {"title":"%s","detail":"%s"}' \
+            "$(json_escape "${CHAIN_TITLES[$c]}")" \
+            "$(json_escape "${CHAIN_BODIES[$c]}")"
+        if (( c < cn - 1 )); then printf ',\n'; else printf '\n'; fi
+    done
+    printf '  ],\n'
+    if [[ -n "$BASELINE_FILE" ]]; then
+        printf '  "baseline": {\n'
+        printf '    "file": "%s",\n' "$(json_escape "$BASELINE_FILE")"
+        printf '    "timestamp": "%s",\n' "$(json_escape "$BASELINE_TIMESTAMP")"
+        if [[ "$BASELINE_SCORE" =~ ^[0-9]+$ ]]; then
+            printf '    "score": %d,\n' "$BASELINE_SCORE"
+        else
+            printf '    "score": null,\n'
+        fi
+        printf '    "grade": "%s",\n' "$(json_escape "$BASELINE_GRADE")"
+        render_json_diff_array "new" ${BASELINE_NEW[@]+"${BASELINE_NEW[@]}"}
+        printf ',\n'
+        render_json_diff_array "resolved" ${BASELINE_GONE[@]+"${BASELINE_GONE[@]}"}
+        printf '\n  },\n'
+    else
+        printf '  "baseline": null,\n'
+    fi
     printf '  "findings": [\n'
     for (( i = 0; i < n; i++ )); do
         fix_json="null"
@@ -2384,7 +3271,7 @@ render_json() {
 }
 
 render_markdown() {
-    local p c h m idx
+    local p c h m idx i
     cat <<EOF
 # macOS Security Audit Report
 
@@ -2402,6 +3289,45 @@ EOF
         printf "\n> Run fully offline — no network request was made. Pending-update data comes from the values macOS cached at its own last check.\n"
     fi
 
+    if (( ${#CHAIN_TITLES[@]} > 0 )); then
+        printf '\n---\n\n## Attack Chains — Fix These Combinations First\n\n'
+        printf 'Findings that are worse together than apart. These do not affect the score:\n'
+        printf 'every finding referenced below is already counted once in its own check. What\n'
+        printf 'they change is the order worth fixing things in.\n\n'
+        for (( i = 0; i < ${#CHAIN_TITLES[@]}; i++ )); do
+            printf '### %d. %s\n\n%s\n\n' "$(( i + 1 ))" "${CHAIN_TITLES[$i]}" "${CHAIN_BODIES[$i]}"
+        done
+    fi
+
+    if [[ -n "$BASELINE_FILE" ]]; then
+        printf '\n---\n\n## Changes Since Baseline\n\n'
+        printf "Compared against \`%s\`" "$BASELINE_FILE"
+        [[ -n "$BASELINE_TIMESTAMP" ]] && printf ' (%s)' "$BASELINE_TIMESTAMP"
+        printf '.\nInformational only — the diff does not affect the score or the exit code.\n\n'
+        if [[ -n "$BASELINE_SCORE" ]]; then
+            printf '| | Baseline | Now |\n|---|---|---|\n'
+            printf '| Score | %s | %s |\n' "$BASELINE_SCORE" "$SCORE"
+            printf '| Grade | %s | %s |\n\n' "${BASELINE_GRADE:-?}" "$GRADE"
+        fi
+        if (( ${#BASELINE_NEW[@]} == 0 && ${#BASELINE_GONE[@]} == 0 )); then
+            printf 'No change — the same findings on the same checks.\n'
+        fi
+        if (( ${#BASELINE_NEW[@]} > 0 )); then
+            printf '### New\n\n'
+            for (( i = 0; i < ${#BASELINE_NEW[@]}; i++ )); do
+                printf -- '- %s\n' "$(format_diff_line "${BASELINE_NEW[$i]}")"
+            done
+            printf '\n'
+        fi
+        if (( ${#BASELINE_GONE[@]} > 0 )); then
+            printf '### Resolved\n\n'
+            for (( i = 0; i < ${#BASELINE_GONE[@]}; i++ )); do
+                printf -- '- %s\n' "$(format_diff_line "${BASELINE_GONE[$i]}")"
+            done
+            printf '\n'
+        fi
+    fi
+
     cat <<'EOF'
 
 ---
@@ -2412,9 +3338,14 @@ EOF
 |---|---|
 EOF
 
-    for p in "${PASSES[@]}"; do
-        printf "| %s | PASS |\n" "$(md_cell "$p")"
-    done
+    # Guarded like the three severity sections below it: under `set -u`, bash 3.2
+    # treats "${arr[@]}" on an empty array as an unbound variable, and a
+    # --category run where nothing passes is not hypothetical.
+    if (( ${#PASSES[@]} > 0 )); then
+        for p in "${PASSES[@]}"; do
+            printf "| %s | PASS |\n" "$(md_cell "$p")"
+        done
+    fi
 
     if (( ${#CRITICALS[@]} > 0 )); then
         printf '\n---\n\n## CRITICAL — Fix Immediately\n\n'
@@ -2468,7 +3399,7 @@ EOF
 ###############################################################################
 
 main() {
-    local entry num cat title fn
+    local entry num cat title fn line i
 
     ACTIVE_CHECKS=$(count_active_checks)
     if [[ -n "$CATEGORY_FILTER" ]]; then
@@ -2514,6 +3445,22 @@ main() {
     (( SCORE < 0 )) && SCORE=0
     GRADE=$(letter_grade "$SCORE")
 
+    evaluate_attack_chains
+
+    # Computed after the grade and deliberately not fed back into it — see the
+    # note above baseline_findings().
+    if [[ -n "$BASELINE_FILE" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && BASELINE_NEW+=("$line")
+        done < <(comm -13 <(baseline_findings_active "$BASELINE_FILE" | sort) <(current_findings | sort))
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && BASELINE_GONE+=("$line")
+        done < <(comm -23 <(baseline_findings_active "$BASELINE_FILE" | sort) <(current_findings | sort))
+        BASELINE_SCORE=$(baseline_meta "$BASELINE_FILE" score)
+        BASELINE_GRADE=$(baseline_meta "$BASELINE_FILE" grade)
+        BASELINE_TIMESTAMP=$(baseline_meta "$BASELINE_FILE" timestamp)
+    fi
+
     if ! $QUIET_MODE; then
         echo ""
         qprint "${CYAN}┌─────────────────────────────────────┐${NC}\n"
@@ -2533,6 +3480,35 @@ main() {
         echo ""
     else
         echo "$GRADE ($SCORE/100)"
+    fi
+
+    # ── Attack chains ────────────────────────────────────────────────
+    if (( ${#CHAIN_TITLES[@]} > 0 )) && ! $QUIET_MODE; then
+        qprint "  ${BOLD}${YELLOW}Attack chains — fix these combinations first${NC}\n"
+        qprint "  These do not change the score. Every finding below is already counted.\n\n"
+        for (( i = 0; i < ${#CHAIN_TITLES[@]}; i++ )); do
+            qprint "  ${BOLD}%d. %s${NC}\n" "$(( i + 1 ))" "${CHAIN_TITLES[$i]}"
+            qprint "%s\n\n" "     ${CHAIN_BODIES[$i]//$'\n'/$'\n'     }"
+        done
+    fi
+
+    # ── Baseline diff ────────────────────────────────────────────────
+    if [[ -n "$BASELINE_FILE" ]] && ! $QUIET_MODE; then
+        qprint "  ${BOLD}Changes since baseline${NC} (%s)\n" "${BASELINE_TIMESTAMP:-unknown date}"
+        if [[ -n "$BASELINE_SCORE" ]]; then
+            qprint "  Score %s → %s    Grade %s → %s\n" \
+                "$BASELINE_SCORE" "$SCORE" "${BASELINE_GRADE:-?}" "$GRADE"
+        fi
+        if (( ${#BASELINE_NEW[@]} == 0 && ${#BASELINE_GONE[@]} == 0 )); then
+            qprint "  ${GREEN}No change${NC} — the same findings on the same checks.\n"
+        fi
+        for (( i = 0; i < ${#BASELINE_NEW[@]}; i++ )); do
+            qprint "  ${RED}NEW${NC}       %s\n" "$(format_diff_line "${BASELINE_NEW[$i]}")"
+        done
+        for (( i = 0; i < ${#BASELINE_GONE[@]}; i++ )); do
+            qprint "  ${GREEN}RESOLVED${NC}  %s\n" "$(format_diff_line "${BASELINE_GONE[$i]}")"
+        done
+        qecho ""
     fi
 
     # ── Report ───────────────────────────────────────────────────────

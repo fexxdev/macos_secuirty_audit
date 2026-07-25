@@ -47,10 +47,11 @@ jobs:
           python3 -m json.tool "$RUNNER_TEMP/report.json" > /dev/null
           echo "JSON report parses"
 
+  # Not advisory: the script and the suite are clean at shellcheck's strictest
+  # level, and a job that is allowed to fail stops telling you anything.
   shellcheck-strict:
-    name: shellcheck (style level, advisory)
+    name: shellcheck (style level)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
