@@ -315,6 +315,22 @@ assert_eq "letter_grade clamps negatives to F" "F" "$(letter_grade -20)"
 assert_eq "json_escape escapes quotes and backslashes" 'a\"b\\c' "$(json_escape 'a"b\c')"
 assert_eq "json_escape escapes newlines and tabs" 'a\nb\tc' "$(json_escape "$(printf 'a\nb\tc')")"
 
+# The three sentences socketfilterfw actually prints. Only one contains the
+# word "enabled", and it is not the strictest setting — matching on that word
+# reported a Mac in state 2 (block all incoming) as a CRITICAL finding.
+assert_eq "firewall_state reads state 0" "0" \
+    "$(firewall_state 'Firewall is disabled. (State = 0)')"
+assert_eq "firewall_state reads state 1" "1" \
+    "$(firewall_state 'Firewall is enabled. (State = 1)')"
+assert_eq "firewall_state reads state 2 (the strictest setting)" "2" \
+    "$(firewall_state 'Firewall is blocking all non-essential incoming connections. (State = 2)')"
+# No "(State = N)" suffix: fall back to the sentence.
+assert_eq "firewall_state falls back to the sentence" "2" \
+    "$(firewall_state 'Firewall is blocking all non-essential incoming connections.')"
+# A failed command must not read as "disabled" — that is a false CRITICAL.
+assert_eq "firewall_state reports unknown on empty output" "unknown" "$(firewall_state '')"
+assert_eq "firewall_state reports unknown on garbage" "unknown" "$(firewall_state 'command not found')"
+
 assert_eq "days_label 1 is singular"  "1 day"   "$(days_label 1)"
 assert_eq "days_label 0 is plural"    "0 days"  "$(days_label 0)"
 assert_eq "days_label 42 is plural"   "42 days" "$(days_label 42)"

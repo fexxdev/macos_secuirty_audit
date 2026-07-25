@@ -458,6 +458,27 @@ daemon_loaded() { launchctl list "$1" &>/dev/null; }
 # "1 day" not "1 days" — a stray plural makes the report read like a draft.
 days_label() { if (( $1 == 1 )); then printf '1 day'; else printf '%s days' "$1"; fi; }
 
+# socketfilterfw prints one of three sentences, and only one of them contains
+# the word "enabled":
+#     Firewall is disabled. (State = 0)
+#     Firewall is enabled. (State = 1)
+#     Firewall is blocking all non-essential incoming connections. (State = 2)
+# Matching on "enabled" therefore reported state 2 — the *strictest* setting —
+# as a CRITICAL finding. The "(State = N)" suffix is the only stable thing to
+# key on; the sentences are fallback for releases that omit it.
+firewall_state() {
+    local out="$1" n
+    n=$(printf '%s\n' "$out" | sed -n 's/.*(State = \([0-9][0-9]*\)).*/\1/p')
+    n=${n%%$'\n'*}
+    if [[ -n "$n" ]]; then printf '%s' "$n"; return; fi
+    case "$out" in
+        *disabled*) printf '0' ;;
+        *blocking*) printf '2' ;;
+        *enabled*)  printf '1' ;;
+        *)          printf 'unknown' ;;
+    esac
+}
+
 # ── Spinner ──────────────────────────────────────────────────────────
 # Only spins on an interactive stdout, so piped/redirected output never gets
 # carriage-return noise. The cleanup trap is installed once, at startup, and is
@@ -804,18 +825,39 @@ Fix: System Settings > Apple ID > iCloud > Find My Mac > Turn On
 
 check_network_firewall() {
     FW_BIN="/usr/libexec/ApplicationFirewall/socketfilterfw"
-    if "$FW_BIN" --getglobalstate 2>/dev/null | grep -q "enabled"; then
-        pass "Firewall is enabled"
-    else
-        critical "Firewall is DISABLED" \
+    FW_STATE=$(firewall_state "$("$FW_BIN" --getglobalstate 2>/dev/null || true)")
+    case "$FW_STATE" in
+        2)
+            pass "Firewall is ON — blocking all non-essential incoming connections"
+            ;;
+        1)
+            pass "Firewall is enabled"
+            ;;
+        0)
+            critical "Firewall is DISABLED" \
 "Your Mac accepts inbound connections from the network with no filtering.
 
 \`\`\`
 Fix: System Settings > Network > Firewall > Turn On
 \`\`\`"
-        show_fix "Enable Firewall" \
-            "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on"
-    fi
+            show_fix "Enable Firewall" \
+                "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on"
+            ;;
+        *)
+            # Reporting CRITICAL because a command failed would be a false
+            # alarm, and false alarms are how a report stops being read.
+            medium "Could not determine firewall state" \
+"\`socketfilterfw --getglobalstate\` returned nothing recognisable, so the firewall
+was neither confirmed on nor confirmed off. Check it by hand.
+
+\`\`\`
+Check: /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
+       System Settings > Network > Firewall
+\`\`\`"
+            show_fix "Check the firewall state by hand" \
+                "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate"
+            ;;
+    esac
 
     if "$FW_BIN" --getstealthmode 2>/dev/null | grep -qi "on\|enabled"; then
         pass "Stealth Mode is ON"
@@ -1453,37 +1495,68 @@ Fix: System Settings > Privacy & Security > Location Services > review app acces
 }
 
 check_privacy_analytics() {
+    CRASH_PLIST="/Library/Application Support/CrashReporter/DiagnosticMessagesHistory.plist"
     ANALYTICS_ISSUES=""
+    # Named separately so the one-line summary can say *which* toggle is on.
+    # "Analytics & telemetry sharing is enabled" reads as though all three are,
+    # and sends you to the wrong settings pane looking for the other two.
+    ANALYTICS_NAMES=""
 
-    SHARE_ANALYTICS=$(defaults read /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist AutoSubmit 2>/dev/null || echo "unknown")
+    SHARE_ANALYTICS=$(defaults read "$CRASH_PLIST" AutoSubmit 2>/dev/null || echo "unknown")
     if [[ "$SHARE_ANALYTICS" == "1" ]]; then
-        ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Apple Analytics (Share Mac Analytics) is ON\n"
+        ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Share Mac Analytics is ON — crash logs, hangs and usage statistics go to Apple\n"
+        ANALYTICS_NAMES="${ANALYTICS_NAMES}Share Mac Analytics, "
     fi
 
-    SHARE_APP_DEV=$(defaults read /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist ThirdPartyDataSubmit 2>/dev/null || echo "unknown")
+    SHARE_APP_DEV=$(defaults read "$CRASH_PLIST" ThirdPartyDataSubmit 2>/dev/null || echo "unknown")
     if [[ "$SHARE_APP_DEV" == "1" ]]; then
-        ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Share with App Developers is ON\n"
+        ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Share with App Developers is ON — the same crash data is forwarded to third-party developers\n"
+        ANALYTICS_NAMES="${ANALYTICS_NAMES}Share with App Developers, "
     fi
 
     SIRI_DATA=$(defaults read com.apple.assistant.support "Siri Data Sharing Opt-In Status" 2>/dev/null || echo "unknown")
     if [[ "$SIRI_DATA" == "2" ]]; then
-        ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Improve Siri & Dictation is ON\n"
+        ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Improve Siri & Dictation is ON — audio recordings of your Siri and dictation requests may be stored and reviewed\n"
+        ANALYTICS_NAMES="${ANALYTICS_NAMES}Improve Siri & Dictation, "
     fi
 
     if [[ -n "$ANALYTICS_ISSUES" ]]; then
-        medium "Analytics & telemetry sharing is enabled" \
-"The following telemetry sharing options are active:
+        ANALYTICS_NAMES="${ANALYTICS_NAMES%, }"
+        medium "Telemetry sharing is ON: $ANALYTICS_NAMES" \
+"Active telemetry, and what each one actually sends:
 
-$(echo -e "$ANALYTICS_ISSUES")
-Data is sent to Apple (and potentially third-party developers), which may include usage patterns and diagnostic information.
+$(printf '%b' "$ANALYTICS_ISSUES")
+The toggles that are not listed above are already off — only the ones named
+here are sending anything.
+
+**Turn them off in the GUI (one pane, all three):**
+
+System Settings > Privacy & Security > Analytics & Improvements
+
+  - \"Share Mac Analytics\"          -> off
+  - \"Share with App Developers\"    -> off  (greyed out until the first is off)
+  - \"Improve Siri & Dictation\"     -> off
+
+**Or from the terminal:**
 
 \`\`\`
-Fix: System Settings > Privacy & Security > Analytics & Improvements > disable all toggles
-\`\`\`"
+sudo defaults write '$CRASH_PLIST' AutoSubmit -bool false
+sudo defaults write '$CRASH_PLIST' ThirdPartyDataSubmit -bool false
+defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 0
+\`\`\`
+
+The first two write a file under /Library and need \`sudo\`; the Siri one is
+per-user and does not. Log out and back in afterwards — the settings pane caches
+these values and will keep showing the old state until you do.
+
+**Turning off \"Improve Siri & Dictation\" does not delete what Apple already
+has.** To erase past recordings: System Settings > Siri & Spotlight > Siri
+History > Delete Siri & Dictation History."
         show_fix "Disable analytics sharing" \
-            "defaults write '/Library/Application Support/CrashReporter/DiagnosticMessagesHistory.plist' AutoSubmit -bool false" \
-            "defaults write '/Library/Application Support/CrashReporter/DiagnosticMessagesHistory.plist' ThirdPartyDataSubmit -bool false" \
+            "sudo defaults write '$CRASH_PLIST' AutoSubmit -bool false" \
+            "sudo defaults write '$CRASH_PLIST' ThirdPartyDataSubmit -bool false" \
             "defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 0"
+        qprint "%b" "${ANALYTICS_ISSUES//  - /          - }"
     else
         pass "Analytics & telemetry sharing appears disabled"
     fi
@@ -1733,6 +1806,13 @@ Fix: Investigate each one. Remove any that are not needed:
                 "sudo launchctl unload /Library/LaunchDaemons/<plist-name>" \
                 "sudo rm /Library/LaunchDaemons/<plist-name>"
         fi
+
+        # These run as root. Naming them in the terminal costs three lines and
+        # saves opening the report to find out which ones they are.
+        while IFS= read -r daemon; do
+            [[ -z "$daemon" ]] && continue
+            qprint "          - %s\n" "$daemon"
+        done <<< "$THIRD_PARTY_DAEMONS"
     else
         pass "No third-party LaunchDaemons"
     fi
@@ -1741,36 +1821,64 @@ Fix: Investigate each one. Remove any that are not needed:
     USER_AGENTS=$(ls ~/Library/LaunchAgents/ 2>/dev/null || true)
     if [[ -n "$USER_AGENTS" ]]; then
         AGENT_COUNT=$(echo "$USER_AGENTS" | wc -l | tr -d ' ')
-        AGENT_LIST=$(echo "$USER_AGENTS" | sed 's/^/  - /')
 
+        # Every agent is listed, with the unrecognised ones marked. The
+        # whitelist decides the severity, not what you are allowed to see:
+        # anything that starts itself at login is worth reading even when it
+        # is expected, and printing only the unknown ones hid the rest.
+        AGENT_LIST=""
         UNKNOWN_AGENTS=""
+        UNKNOWN_COUNT=0
         while IFS= read -r agent; do
             [[ -z "$agent" ]] && continue
-            if ! is_known_agent "$agent"; then
-                UNKNOWN_AGENTS+="  - ${agent}\n"
+            if is_known_agent "$agent"; then
+                AGENT_LIST="${AGENT_LIST}  - ${agent}\n"
+            else
+                AGENT_LIST="${AGENT_LIST}  - ${agent}  <-- unknown\n"
+                UNKNOWN_AGENTS="${UNKNOWN_AGENTS}  - ${agent}\n"
+                UNKNOWN_COUNT=$(( UNKNOWN_COUNT + 1 ))
             fi
         done <<< "$USER_AGENTS"
-        UNKNOWN_COUNT=$(echo -e "$UNKNOWN_AGENTS" | grep -c '^ ' || true)
+        AGENT_LIST=$(printf '%b' "$AGENT_LIST")
 
         if (( UNKNOWN_COUNT > 0 )); then
             medium "$UNKNOWN_COUNT unknown user LaunchAgent(s) found (${AGENT_COUNT} total) — review for legitimacy" \
 "Unknown agents (not in whitelist):
-$(echo -e "$UNKNOWN_AGENTS")
-All agents:
+$(printf '%b' "$UNKNOWN_AGENTS")
+All $AGENT_COUNT agents in ~/Library/LaunchAgents:
 $AGENT_LIST
+
+\"Unknown\" means only that the filename is not in this tool's whitelist of
+common software — it is a prompt to look, not a verdict. To see what one
+actually does:
+
+\`\`\`
+     cat ~/Library/LaunchAgents/<plist>            # what it runs, and when
+     launchctl list | grep <label>                 # whether it is loaded now
+\`\`\`
 
 \`\`\`
 Fix: Review each one. Remove unneeded agents:
      launchctl unload ~/Library/LaunchAgents/<plist>
      rm ~/Library/LaunchAgents/<plist>
 \`\`\`"
-            qecho -e "${UNKNOWN_AGENTS//  - /          - }"
-            show_fix "Remove unwanted LaunchAgents (example)" \
+            show_fix "Inspect an agent, then remove it if unwanted" \
+                "cat ~/Library/LaunchAgents/<plist-name>" \
                 "launchctl unload ~/Library/LaunchAgents/<plist-name>" \
                 "rm ~/Library/LaunchAgents/<plist-name>"
         else
             pass "$AGENT_COUNT user LaunchAgents (all known/whitelisted)"
         fi
+
+        # Printed in both branches: the inventory is the useful part.
+        while IFS= read -r agent; do
+            [[ -z "$agent" ]] && continue
+            if is_known_agent "$agent"; then
+                qprint "          - %s\n" "$agent"
+            else
+                qprint "          - %s  %b<-- unknown%b\n" "$agent" "$YELLOW" "$NC"
+            fi
+        done <<< "$USER_AGENTS"
     else
         pass "No user LaunchAgents"
     fi
@@ -1888,22 +1996,91 @@ check_encryption_recovery_key() {
         return
     fi
 
+    # Both queries exit 11 with "requires root access" for a normal user, and
+    # this tool never runs sudo. The old code folded that failure into the same
+    # branch as a genuine "false", so the check reported a missing recovery key
+    # on every Mac with FileVault on — it could not pass, ever.
     local has_personal has_institutional
-    has_personal=$(fdesetup haspersonalrecoverykey 2>/dev/null || echo "unknown")
-    has_institutional=$(fdesetup hasinstitutionalrecoverykey 2>/dev/null || echo "unknown")
+    has_personal=$(fdesetup haspersonalrecoverykey 2>/dev/null || true)
+    has_institutional=$(fdesetup hasinstitutionalrecoverykey 2>/dev/null || true)
 
     if echo "$has_personal" | grep -qi "true"; then
         pass "FileVault personal recovery key exists"
     elif echo "$has_institutional" | grep -qi "true"; then
         pass "FileVault institutional recovery key exists"
-    else
-        high "No FileVault recovery key found" \
-"Without a recovery key, if you forget your password you will permanently lose access to all data on this Mac.
+    elif [[ -z "$has_personal$has_institutional" ]]; then
+        medium "FileVault recovery key could not be verified (the query needs root)" \
+"FileVault is on, which is what matters most. Whether a *recovery key* also
+exists cannot be read without root, and this tool never runs \`sudo\`, so this is
+a prompt to check rather than a finding against your machine.
+
+**Why it matters.** FileVault encrypts the whole disk. Your login password is
+what normally unlocks it. If you forget that password — or the account gets
+damaged — the only other way in is a recovery mechanism. Without one the data is
+gone permanently; there is no reset, no support call, no back door. That is the
+point of the encryption.
+
+**macOS offers two, and they are not the same thing:**
+
+  1. **iCloud unlock** — chosen during FileVault setup as \"Allow my iCloud
+     account to unlock my disk\". Recovery goes through your Apple Account.
+     Convenient, but it ties disk recovery to an online account, and
+     \`haspersonalrecoverykey\` reports **false** for it — this is the usual
+     reason the check looks alarming on a perfectly recoverable Mac.
+  2. **Personal recovery key** — a 24-character code macOS shows you exactly
+     once. Offline, self-contained, and yours to store.
+
+**Check which one you have:**
 
 \`\`\`
-Fix: sudo fdesetup changerecovery -personal
-     Store the recovery key in a secure location (password manager, safe, etc.)
-\`\`\`"
+sudo fdesetup haspersonalrecoverykey      # true = a 24-character key exists
+sudo fdesetup status                      # confirms FileVault itself is on
+\`\`\`
+
+**Create (or replace) a personal recovery key:**
+
+\`\`\`
+sudo fdesetup changerecovery -personal
+\`\`\`
+
+It asks for an admin password, then prints a new key. Two things to know before
+you run it: the key is shown **once and never again**, and it **invalidates any
+previous personal key** — an old one written down somewhere stops working the
+moment you do this.
+
+**Where to keep it.** A password manager entry, or on paper somewhere physically
+safe. Not on the encrypted disk itself: if you cannot boot the Mac you cannot
+read the key that unlocks it.
+
+**Or use the GUI:** System Settings > Privacy & Security > FileVault > Turn Off,
+then Turn On again, and choose \"Create a recovery key and do not use my iCloud
+account\" when prompted. Slower — it re-encrypts — but it shows the key on screen."
+        show_fix "Check whether a recovery key exists, then create one if not" \
+            "sudo fdesetup haspersonalrecoverykey" \
+            "sudo fdesetup changerecovery -personal"
+    else
+        high "No FileVault recovery key found" \
+"Confirmed with root: this Mac has neither a personal nor an institutional
+recovery key. Your login password is the only thing that can unlock the disk.
+Forget it, or lose the account, and every byte on this machine is unrecoverable
+— no reset, no support call, no back door. That is what the encryption is for.
+
+**Fix it now:**
+
+\`\`\`
+sudo fdesetup changerecovery -personal
+\`\`\`
+
+It asks for an admin password and prints a 24-character key. It is shown **once
+and never again**, and it invalidates any previous personal key.
+
+**Store it off this disk** — a password manager, or paper somewhere physically
+safe. A key saved onto the encrypted volume is useless: if you cannot boot the
+Mac, you cannot read the file that would let you boot the Mac.
+
+An alternative is iCloud unlock (System Settings > Privacy & Security >
+FileVault), which recovers through your Apple Account instead. Convenient, but
+it makes disk recovery depend on an online account staying accessible."
         show_fix "Create a FileVault recovery key" \
             "sudo fdesetup changerecovery -personal"
     fi
