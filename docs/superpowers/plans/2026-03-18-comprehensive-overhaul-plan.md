@@ -1,5 +1,13 @@
 # Comprehensive Overhaul (v2.0.0) Implementation Plan
 
+> **Historical — completed and superseded.** This document describes the v2.0.0
+> overhaul as it was planned on 2026-03-18. It shipped, and v3.0.0 then replaced
+> several of the mechanisms described below: the numeric check-number → category
+> map became the `CHECKS` registry, and the `_record_<severity>_json` dual-call
+> API became a single findings store written by `pass()`/`critical()`/`high()`/
+> `medium()`. Read `CLAUDE.md` for how the script works today; keep this only as
+> a record of the decisions.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Overhaul macos-security-audit from 20 to 36 checks, refactor internals, and add UX features (JSON output, category filtering, quiet/no-color modes, terminal summary table, exit codes).

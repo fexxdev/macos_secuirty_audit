@@ -1,6 +1,8 @@
 # Generated audit reports (contain machine-specific sensitive info)
 security-audit-*.md
+security-audit-*.json
 bin/security-audit-*.md
+bin/security-audit-*.json
 
 # macOS
 .DS_Store
@@ -9,3 +11,6 @@ bin/security-audit-*.md
 *.swp
 *.swo
 *~
+
+# Local agent settings
+.claude/

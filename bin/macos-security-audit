@@ -8,7 +8,7 @@
 #
 # Author:  fexxdev
 # License: MIT
-# Source:  https://github.com/fexxdev/macos-security-audit
+# Source:  https://github.com/fexxdev/macos_secuirty_audit
 #
 # Usage:
 #   macos-security-audit                          # run with default output
@@ -17,14 +17,22 @@
 #   macos-security-audit --json                   # output as JSON
 #   macos-security-audit --category encryption    # run only encryption checks
 #   macos-security-audit --quiet                  # print only the grade
+#   macos-security-audit --redact                 # mask the serial number in the report
+#   macos-security-audit --online                 # allow the one network-touching check
 #   macos-security-audit --list-checks            # show all checks
 #
 # The report is a Markdown file you can read, share, or diff over time.
+#
+# The audit is READ-ONLY and OFFLINE by default: it never changes system state
+# and never makes a network request unless --online is passed explicitly.
+#
+# Setting MSA_LIB_MODE=1 sources this file without running an audit, so the
+# test suite can unit-test the helper functions in isolation.
 
 set -euo pipefail
 
-VERSION="2.1.0"
-TOTAL_CHECKS=42
+VERSION="3.0.0"
+MSA_LIB_MODE="${MSA_LIB_MODE:-0}"
 
 # ── Colours / symbols for terminal output ────────────────────────────
 if [[ -t 1 ]]; then
@@ -32,60 +40,114 @@ if [[ -t 1 ]]; then
 else
     RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC=''
 fi
-PASS="${GREEN}PASS${NC}"; FAIL="${RED}FAIL${NC}"; WARN="${YELLOW}WARN${NC}"; INFO="${CYAN}INFO${NC}"
+PASS="${GREEN}PASS${NC}"; FAIL="${RED}FAIL${NC}"; WARN="${YELLOW}WARN${NC}"
 
 # ── Output modes ─────────────────────────────────────────────────────
 JSON_MODE=false
 QUIET_MODE=false
+ONLINE_MODE=false
+REDACT_MODE=false
 CATEGORY_FILTER=""
 PARTIAL_AUDIT=false
 
+###############################################################################
+# CHECK REGISTRY — the single source of truth
+#
+# Format: "<number>|<category>|<title>|<function>"
+#
+# Adding a check = write the check_* function + append one line here. The
+# number, the category filter, --list-checks, --help and the run order are all
+# derived from this array; nothing else needs to be touched.
+###############################################################################
+CHECKS=(
+    "1|encryption|Disk Encryption (FileVault)|check_encryption_filevault"
+    "2|encryption|Time Machine Backup & Encryption|check_encryption_timemachine"
+    "3|system|System Integrity Protection (SIP)|check_system_sip"
+    "4|system|Gatekeeper & Secure Boot|check_system_gatekeeper"
+    "5|system|Lockdown Mode|check_system_lockdown"
+    "6|system|Rapid Security Response|check_system_rsr"
+    "7|system|XProtect Definitions|check_system_xprotect"
+    "8|system|Kernel Extensions|check_system_kext"
+    "9|system|Find My Mac|check_system_findmymac"
+    "10|network|Firewall & Stealth Mode|check_network_firewall"
+    "11|network|Network Exposure|check_network_exposure"
+    "12|network|DNS & Network|check_network_dns"
+    "13|network|Wi-Fi Auto-Join for Open Networks|check_network_wifi"
+    "14|network|Internet Sharing|check_network_internet_sharing"
+    "15|network|Wake on Network Access|check_network_wake"
+    "16|sharing|Sharing Services|check_sharing_services"
+    "17|sharing|Remote Apple Events|check_sharing_remote_apple_events"
+    "18|sharing|Content Caching|check_sharing_content_caching"
+    "19|sharing|Printer Sharing|check_sharing_printer"
+    "20|sharing|Media Sharing|check_sharing_media"
+    "21|sharing|Handoff|check_sharing_handoff"
+    "22|auth|User Accounts & Authentication|check_auth_users"
+    "23|auth|SSH Configuration|check_auth_ssh"
+    "24|auth|Screen Saver Timeout|check_auth_screensaver"
+    "25|auth|Login Window Configuration|check_auth_login_window"
+    "26|auth|Touch ID|check_auth_touchid"
+    "27|auth|USB Restricted Mode|check_auth_usb"
+    "28|privacy|Location Services|check_privacy_location"
+    "29|privacy|Analytics & Telemetry Sharing|check_privacy_analytics"
+    "30|privacy|Bluetooth Discoverability|check_privacy_bluetooth"
+    "31|privacy|Siri Voice Trigger|check_privacy_siri"
+    "32|software|Software Updates|check_software_updates"
+    "33|software|Installed Software & Persistence|check_software_review"
+    "34|software|Safari Safe File Auto-Open|check_software_safari"
+    "35|software|Secure Keyboard Entry (Terminal)|check_software_secure_keyboard"
+    "36|software|Docker Daemons|check_software_docker"
+    "37|encryption|FileVault Recovery Key|check_encryption_recovery_key"
+    "38|system|Configuration Profiles|check_system_profiles"
+    "39|system|MRT / XProtect Remediator|check_system_mrt"
+    "40|auth|Password Policy|check_auth_password_policy"
+    "41|privacy|Privacy Permissions (TCC)|check_privacy_tcc"
+    "42|software|Safari Privacy & Security|check_software_safari_privacy"
+)
+
+TOTAL_CHECKS=${#CHECKS[@]}
+
+# Category order used by --help / --list-checks (declaration order in CHECKS).
+CATEGORIES=(encryption system network sharing auth privacy software)
+
+# check_field <number> <1=category|2=title|3=function>
+check_field() {
+    local want="$1" field="$2" entry num
+    for entry in "${CHECKS[@]}"; do
+        num="${entry%%|*}"
+        if [[ "$num" == "$want" ]]; then
+            case "$field" in
+                1) entry="${entry#*|}"; printf '%s' "${entry%%|*}" ;;
+                2) entry="${entry#*|}"; entry="${entry#*|}"; printf '%s' "${entry%%|*}" ;;
+                3) printf '%s' "${entry##*|}" ;;
+            esac
+            return 0
+        fi
+    done
+    printf 'unknown'
+    return 1
+}
+
 # ── list_checks ──────────────────────────────────────────────────────
 list_checks() {
+    local entry num cat title
     printf " %-4s %-14s %s\n" "#" "Category" "Check"
     printf " %-4s %-14s %s\n" "---" "--------------" "------------------------------------"
-    printf " %-4s %-14s %s\n" "1"  "encryption" "Disk Encryption (FileVault)"
-    printf " %-4s %-14s %s\n" "2"  "encryption" "Time Machine Backup & Encryption"
-    printf " %-4s %-14s %s\n" "3"  "system"     "System Integrity Protection (SIP)"
-    printf " %-4s %-14s %s\n" "4"  "system"     "Gatekeeper & Secure Boot"
-    printf " %-4s %-14s %s\n" "5"  "system"     "Lockdown Mode"
-    printf " %-4s %-14s %s\n" "6"  "system"     "Rapid Security Response"
-    printf " %-4s %-14s %s\n" "7"  "system"     "XProtect Definitions"
-    printf " %-4s %-14s %s\n" "8"  "system"     "Kernel Extensions"
-    printf " %-4s %-14s %s\n" "9"  "system"     "Find My Mac"
-    printf " %-4s %-14s %s\n" "10" "network"    "Firewall & Stealth Mode"
-    printf " %-4s %-14s %s\n" "11" "network"    "Network Exposure"
-    printf " %-4s %-14s %s\n" "12" "network"    "DNS & Network"
-    printf " %-4s %-14s %s\n" "13" "network"    "Wi-Fi Auto-Join for Open Networks"
-    printf " %-4s %-14s %s\n" "14" "network"    "Internet Sharing"
-    printf " %-4s %-14s %s\n" "15" "network"    "Wake on Network Access"
-    printf " %-4s %-14s %s\n" "16" "sharing"    "Sharing Services"
-    printf " %-4s %-14s %s\n" "17" "sharing"    "Remote Apple Events"
-    printf " %-4s %-14s %s\n" "18" "sharing"    "Content Caching"
-    printf " %-4s %-14s %s\n" "19" "sharing"    "Printer Sharing"
-    printf " %-4s %-14s %s\n" "20" "sharing"    "Media Sharing"
-    printf " %-4s %-14s %s\n" "21" "sharing"    "Handoff"
-    printf " %-4s %-14s %s\n" "22" "auth"       "User Accounts & Authentication"
-    printf " %-4s %-14s %s\n" "23" "auth"       "SSH Configuration"
-    printf " %-4s %-14s %s\n" "24" "auth"       "Screen Saver Timeout"
-    printf " %-4s %-14s %s\n" "25" "auth"       "Login Window Configuration"
-    printf " %-4s %-14s %s\n" "26" "auth"       "Touch ID"
-    printf " %-4s %-14s %s\n" "27" "auth"       "USB Restricted Mode"
-    printf " %-4s %-14s %s\n" "28" "privacy"    "Location Services"
-    printf " %-4s %-14s %s\n" "29" "privacy"    "Analytics & Telemetry Sharing"
-    printf " %-4s %-14s %s\n" "30" "privacy"    "Bluetooth Discoverability"
-    printf " %-4s %-14s %s\n" "31" "privacy"    "Siri Voice Trigger"
-    printf " %-4s %-14s %s\n" "32" "software"   "Software Updates"
-    printf " %-4s %-14s %s\n" "33" "software"   "Installed Software & Persistence"
-    printf " %-4s %-14s %s\n" "34" "software"   "Safari Safe File Auto-Open"
-    printf " %-4s %-14s %s\n" "35" "software"   "Secure Keyboard Entry (Terminal)"
-    printf " %-4s %-14s %s\n" "36" "software"   "Docker Daemons"
-    printf " %-4s %-14s %s\n" "37" "encryption" "FileVault Recovery Key"
-    printf " %-4s %-14s %s\n" "38" "system"     "Configuration Profiles"
-    printf " %-4s %-14s %s\n" "39" "system"     "MRT / XProtect Remediator"
-    printf " %-4s %-14s %s\n" "40" "auth"       "Password Policy"
-    printf " %-4s %-14s %s\n" "41" "privacy"    "Privacy Permissions (TCC)"
-    printf " %-4s %-14s %s\n" "42" "software"   "Safari Privacy & Security"
+    for entry in "${CHECKS[@]}"; do
+        IFS='|' read -r num cat title _ <<< "$entry"
+        printf " %-4s %-14s %s\n" "$num" "$cat" "$title"
+    done
+}
+
+# Grouped listing used by --help
+list_checks_grouped() {
+    local cat entry num ecat title
+    for cat in "${CATEGORIES[@]}"; do
+        printf "\n  %s:\n" "$(tr '[:lower:]' '[:upper:]' <<< "${cat:0:1}")${cat:1}"
+        for entry in "${CHECKS[@]}"; do
+            IFS='|' read -r num ecat title _ <<< "$entry"
+            [[ "$ecat" == "$cat" ]] && printf "    %2s  %s\n" "$num" "$title"
+        done
+    done
 }
 
 # ── Usage ─────────────────────────────────────────────────────────────
@@ -94,6 +156,8 @@ usage() {
 macos-security-audit v${VERSION}
 
 Comprehensive macOS security audit with Markdown report generation.
+Read-only and offline: it never changes system state, and makes no network
+request unless --online is passed.
 
 USAGE:
     macos-security-audit [OPTIONS]
@@ -105,10 +169,20 @@ OPTIONS:
     --show-fix        After each finding, print fix command(s) in a copy-pasteable block
     --json            Output report as JSON instead of Markdown
     --category CAT    Run only checks in given categories (comma-separated)
-                      Categories: encryption, system, network, sharing, auth, privacy, software
+                      Categories: $(IFS=,; printf '%s' "${CATEGORIES[*]}")
     --quiet           Suppress terminal output, print only the grade
     --no-color        Disable ANSI color codes in terminal output
+    --redact          Mask the hardware serial number in the report
+    --online          Allow the single check that queries Apple's update servers
     --list-checks     List all checks with category and description
+
+    Long options also accept the --opt=value form.
+
+EXIT CODES:
+    0   grade A+ … B-
+    1   grade C+ … C-
+    2   grade D+ … F
+    64  invalid usage
 
 EXAMPLES:
     macos-security-audit
@@ -118,93 +192,92 @@ EXAMPLES:
     macos-security-audit --quiet
     macos-security-audit --list-checks
 
-CHECKS PERFORMED (42):
-
-  Encryption:
-     1  Disk Encryption (FileVault)
-     2  Time Machine Backup & Encryption
-    37  FileVault Recovery Key
-
-  System:
-     3  System Integrity Protection (SIP)
-     4  Gatekeeper & Secure Boot
-     5  Lockdown Mode
-     6  Rapid Security Response
-     7  XProtect Definitions
-     8  Kernel Extensions
-     9  Find My Mac
-    38  Configuration Profiles
-    39  MRT / XProtect Remediator
-
-  Network:
-    10  Firewall & Stealth Mode
-    11  Network Exposure
-    12  DNS & Network
-    13  Wi-Fi Auto-Join for Open Networks
-    14  Internet Sharing
-    15  Wake on Network Access
-
-  Sharing:
-    16  Sharing Services
-    17  Remote Apple Events
-    18  Content Caching
-    19  Printer Sharing
-    20  Media Sharing
-    21  Handoff
-
-  Auth:
-    22  User Accounts & Authentication
-    23  SSH Configuration
-    24  Screen Saver Timeout
-    25  Login Window Configuration
-    26  Touch ID
-    27  USB Restricted Mode
-    40  Password Policy
-
-  Privacy:
-    28  Location Services
-    29  Analytics & Telemetry Sharing
-    30  Bluetooth Discoverability
-    31  Siri Voice Trigger
-    41  Privacy Permissions (TCC)
-
-  Software:
-    32  Software Updates
-    33  Installed Software & Persistence
-    34  Safari Safe File Auto-Open
-    35  Secure Keyboard Entry (Terminal)
-    36  Docker Daemons
-    42  Safari Privacy & Security
+CHECKS PERFORMED ($TOTAL_CHECKS):
 EOF
+    list_checks_grouped
     exit 0
 }
 
 # ── Parse arguments ──────────────────────────────────────────────────
+EX_USAGE=64
+
 DATE_STAMP=$(date +%Y-%m-%d)
 OUTPUT_FILE=""
 SHOW_FIX=false
 
+die_usage() {
+    printf '%berror:%b %s\n' "$RED" "$NC" "$1" >&2
+    printf "Run 'macos-security-audit --help' for usage.\n" >&2
+    exit "$EX_USAGE"
+}
+
+no_color() {
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC=''
+    PASS="PASS"; FAIL="FAIL"; WARN="WARN"
+}
+
+# Skipped entirely in library mode: a harness that sources this file has its own
+# argv, and parsing it here would either misfire or exit the harness.
+if [[ "$MSA_LIB_MODE" != "1" ]]; then
 while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --help)       usage ;;
-        --version)    echo "macos-security-audit v${VERSION}"; exit 0 ;;
-        --output)     OUTPUT_FILE="${2:-}"; shift 2 ;;
-        --show-fix)   SHOW_FIX=true; shift ;;
-        --json)       JSON_MODE=true; shift ;;
-        --quiet)      QUIET_MODE=true; shift ;;
-        --no-color)
-            RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; NC=''
-            PASS="PASS"; FAIL="FAIL"; WARN="WARN"; INFO="INFO"
-            shift ;;
-        --category)   CATEGORY_FILTER="${2:-}"; shift 2 ;;
+    # Accept both "--opt value" and "--opt=value".
+    opt="$1"; optval=""; has_optval=false
+    if [[ "$opt" == --*=* ]]; then
+        optval="${opt#*=}"; opt="${opt%%=*}"; has_optval=true
+    fi
+    case "$opt" in
+        --help)        usage ;;
+        --version)     echo "macos-security-audit v${VERSION}"; exit 0 ;;
         --list-checks) list_checks; exit 0 ;;
+        --show-fix)    SHOW_FIX=true; shift ;;
+        --json)        JSON_MODE=true; shift ;;
+        --quiet)       QUIET_MODE=true; shift ;;
+        --online)      ONLINE_MODE=true; shift ;;
+        --redact)      REDACT_MODE=true; shift ;;
+        --no-color)    no_color; shift ;;
+        --output)
+            if $has_optval; then
+                OUTPUT_FILE="$optval"; shift
+            else
+                [[ $# -ge 2 ]] || die_usage "--output requires a FILE argument"
+                OUTPUT_FILE="$2"; shift 2
+            fi
+            [[ -n "$OUTPUT_FILE" ]] || die_usage "--output requires a non-empty FILE argument"
+            ;;
+        --category)
+            if $has_optval; then
+                CATEGORY_FILTER="$optval"; shift
+            else
+                [[ $# -ge 2 ]] || die_usage "--category requires a CAT argument"
+                CATEGORY_FILTER="$2"; shift 2
+            fi
+            [[ -n "$CATEGORY_FILTER" ]] || die_usage "--category requires a non-empty CAT argument"
+            ;;
         *)
-            printf "${RED}Unknown option: %s${NC}\n" "$1"
-            printf "Run 'macos-security-audit --help' for usage.\n"
-            exit 1
+            die_usage "unknown option: $1"
             ;;
     esac
 done
+fi
+
+# ── Validate --category against the registry ─────────────────────────
+if [[ -n "$CATEGORY_FILTER" ]]; then
+    # Normalise: lowercase, drop whitespace, reject anything not in CATEGORIES.
+    CATEGORY_FILTER=$(tr '[:upper:]' '[:lower:]' <<< "$CATEGORY_FILTER" | tr -d '[:space:]')
+    _valid=""
+    IFS=',' read -r -a _requested <<< "$CATEGORY_FILTER"
+    for _cat in "${_requested[@]}"; do
+        [[ -z "$_cat" ]] && continue
+        _found=false
+        for _known in "${CATEGORIES[@]}"; do
+            [[ "$_cat" == "$_known" ]] && { _found=true; break; }
+        done
+        $_found || die_usage "unknown category: $_cat (valid: $(IFS=,; printf '%s' "${CATEGORIES[*]}"))"
+        _valid="${_valid:+$_valid,}$_cat"
+    done
+    [[ -n "$_valid" ]] || die_usage "--category requires at least one category"
+    CATEGORY_FILTER="$_valid"
+fi
 
 # Set default output file based on mode
 if [[ -z "$OUTPUT_FILE" ]]; then
@@ -215,66 +288,52 @@ if [[ -z "$OUTPUT_FILE" ]]; then
     fi
 fi
 
-# Show-fix helper: prints a copy-pasteable fix block after a finding.
-# Also stores the fix text for JSON output.
-LAST_FIX_TEXT=""
-show_fix() {
-    local description="$1"
-    shift
-    LAST_FIX_TEXT="$description"
-    for cmd in "$@"; do
-        LAST_FIX_TEXT="${LAST_FIX_TEXT}\n${cmd}"
-    done
-    if $SHOW_FIX && ! $QUIET_MODE; then
-        echo ""
-        printf "  ${BOLD}${YELLOW}FIX:${NC} %s\n" "$description"
-        for cmd in "$@"; do
-            printf "  ${CYAN}\$${NC} %s\n" "$cmd"
-        done
+# Fail before running a full audit if the report could not be written anyway.
+# An existing target only needs to be writable itself — that is what makes
+# `--output /dev/null` work even though /dev is not writable.
+if [[ "$MSA_LIB_MODE" != "1" ]]; then
+    if [[ -d "$OUTPUT_FILE" ]]; then
+        die_usage "output path is a directory: $OUTPUT_FILE"
+    elif [[ -e "$OUTPUT_FILE" ]]; then
+        [[ -w "$OUTPUT_FILE" ]] || die_usage "output file is not writable: $OUTPUT_FILE"
+    else
+        _out_dir=$(dirname -- "$OUTPUT_FILE")
+        [[ -d "$_out_dir" ]] || die_usage "output directory does not exist: $_out_dir"
+        [[ -w "$_out_dir" ]] || die_usage "output directory is not writable: $_out_dir"
     fi
-}
+fi
 
 # ── Category filtering ──────────────────────────────────────────────
-check_category() {
-    case $1 in
-        1|2|37) echo "encryption" ;;
-        3|4|5|6|7|8|9|38|39) echo "system" ;;
-        10|11|12|13|14|15) echo "network" ;;
-        16|17|18|19|20|21) echo "sharing" ;;
-        22|23|24|25|26|27|40) echo "auth" ;;
-        28|29|30|31|41) echo "privacy" ;;
-        32|33|34|35|36|42) echo "software" ;;
-        *) echo "unknown" ;;
-    esac
-}
+check_category() { check_field "$1" 1; }
+check_title()    { check_field "$1" 2; }
 
 should_run_check() {
-    local check_num=$1
-    if [[ -z "$CATEGORY_FILTER" ]]; then
-        return 0
-    fi
+    [[ -z "$CATEGORY_FILTER" ]] && return 0
     local cat
-    cat=$(check_category "$check_num")
-    if echo ",$CATEGORY_FILTER," | grep -q ",$cat,"; then
-        return 0
-    fi
+    cat=$(check_category "$1")
+    case ",$CATEGORY_FILTER," in
+        *",$cat,"*) return 0 ;;
+    esac
     return 1
 }
 
 # Count checks that will actually run
 count_active_checks() {
-    local count=0
-    for i in $(seq 1 "$TOTAL_CHECKS"); do
-        if should_run_check "$i"; then
+    local count=0 entry num
+    for entry in "${CHECKS[@]}"; do
+        num="${entry%%|*}"
+        if should_run_check "$num"; then
             count=$((count + 1))
         fi
     done
-    echo "$count"
+    printf '%s' "$count"
 }
 
 # ── Quiet-mode aware output ──────────────────────────────────────────
+# NOTE: $1 is a printf FORMAT string — never pass unvalidated data as $1.
 qprint() {
     if ! $QUIET_MODE; then
+        # shellcheck disable=SC2059  # forwarding a caller-supplied format is the point
         printf "$@"
     fi
 }
@@ -296,22 +355,42 @@ json_escape() {
     printf '%s' "$s"
 }
 
-declare -a JSON_FINDINGS=()
+# ── Findings store ───────────────────────────────────────────────────
+# Every finding is recorded exactly once, by the severity helper that reports
+# it; the Markdown and JSON renderers both read from here. show_fix() attaches
+# its command block to the finding recorded just before it, so a fix can never
+# drift out of sync with the finding it belongs to.
+declare -a F_NUM=() F_CAT=() F_TITLE=() F_SEV=() F_SUMMARY=() F_DETAIL=() F_FIX=()
 
-add_json_finding() {
-    local check_num="$1" category="$2" title="$3" severity="$4" summary="$5" detail="$6" fix="${7:-}"
-    local fix_json="null"
-    if [[ -n "$fix" ]]; then
-        fix_json="\"$(json_escape "$fix")\""
+record_finding() {
+    F_NUM+=("$CURRENT_CHECK_NUM")
+    F_CAT+=("$CURRENT_CHECK_CATEGORY")
+    F_TITLE+=("$CURRENT_CHECK_TITLE")
+    F_SEV+=("$1")
+    F_SUMMARY+=("$2")
+    F_DETAIL+=("${3:-}")
+    F_FIX+=("")
+}
+
+# Prints a copy-pasteable fix block (with --show-fix) and stores it on the
+# finding that was just recorded.
+show_fix() {
+    local description="$1" cmd fix_text
+    shift
+    fix_text="$description"
+    for cmd in "$@"; do
+        fix_text="${fix_text}"$'\n'"${cmd}"
+    done
+    if (( ${#F_FIX[@]} > 0 )); then
+        F_FIX[$(( ${#F_FIX[@]} - 1 ))]="$fix_text"
     fi
-    JSON_FINDINGS+=("$(printf '{"check_number":%d,"category":"%s","title":"%s","severity":"%s","summary":"%s","detail":"%s","fix":%s}' \
-        "$check_num" \
-        "$(json_escape "$category")" \
-        "$(json_escape "$title")" \
-        "$(json_escape "$severity")" \
-        "$(json_escape "$summary")" \
-        "$(json_escape "$detail")" \
-        "$fix_json")")
+    if $SHOW_FIX && ! $QUIET_MODE; then
+        echo ""
+        printf "  %b%bFIX:%b %s\n" "$BOLD" "$YELLOW" "$NC" "$description"
+        for cmd in "$@"; do
+            printf "  %b\$%b %s\n" "$CYAN" "$NC" "$cmd"
+        done
+    fi
 }
 
 # ── Accumulators for the report ──────────────────────────────────────
@@ -329,55 +408,33 @@ CHECKS_RUN=0
 pass() {
     PASSES+=("$1")
     qprint "  ${PASS}  %s\n" "$1"
-    if $JSON_MODE; then
-        add_json_finding "$CURRENT_CHECK_NUM" "$CURRENT_CHECK_CATEGORY" "$CURRENT_CHECK_TITLE" "pass" "$1" "" ""
-    fi
+    record_finding "pass" "$1" ""
 }
 
 critical() {
-    CRITICALS+=("$(printf '%s\n\n%s' "$1" "$2")")
+    CRITICALS+=("$(printf '%s\n\n%s' "$1" "${2:-}")")
     SCORE=$((SCORE - 8))
     qprint "  ${FAIL}  %s\n" "$1"
-    LAST_FIX_TEXT=""
-}
-
-_record_critical_json() {
-    if $JSON_MODE; then
-        add_json_finding "$CURRENT_CHECK_NUM" "$CURRENT_CHECK_CATEGORY" "$CURRENT_CHECK_TITLE" "critical" "$1" "$2" "$LAST_FIX_TEXT"
-    fi
-    LAST_FIX_TEXT=""
+    record_finding "critical" "$1" "${2:-}"
 }
 
 high() {
-    HIGHS+=("$(printf '%s\n\n%s' "$1" "$2")")
+    HIGHS+=("$(printf '%s\n\n%s' "$1" "${2:-}")")
     SCORE=$((SCORE - 4))
     qprint "  ${WARN}  %s\n" "$1"
-    LAST_FIX_TEXT=""
-}
-
-_record_high_json() {
-    if $JSON_MODE; then
-        add_json_finding "$CURRENT_CHECK_NUM" "$CURRENT_CHECK_CATEGORY" "$CURRENT_CHECK_TITLE" "high" "$1" "$2" "$LAST_FIX_TEXT"
-    fi
-    LAST_FIX_TEXT=""
+    record_finding "high" "$1" "${2:-}"
 }
 
 medium() {
-    MEDIUMS+=("$(printf '%s\n\n%s' "$1" "$2")")
+    MEDIUMS+=("$(printf '%s\n\n%s' "$1" "${2:-}")")
     SCORE=$((SCORE - 2))
     qprint "  ${WARN}  %s\n" "$1"
-    LAST_FIX_TEXT=""
-}
-
-_record_medium_json() {
-    if $JSON_MODE; then
-        add_json_finding "$CURRENT_CHECK_NUM" "$CURRENT_CHECK_CATEGORY" "$CURRENT_CHECK_TITLE" "medium" "$1" "$2" "$LAST_FIX_TEXT"
-    fi
-    LAST_FIX_TEXT=""
+    record_finding "medium" "$1" "${2:-}"
 }
 
 letter_grade() {
     local s=$1
+    (( s < 0 )) && s=0
     if   (( s >= 95 )); then echo "A+"
     elif (( s >= 90 )); then echo "A"
     elif (( s >= 85 )); then echo "A-"
@@ -398,45 +455,71 @@ letter_grade() {
 cmd_exists()  { command -v "$1" &>/dev/null; }
 daemon_loaded() { launchctl list "$1" &>/dev/null; }
 
+# "1 day" not "1 days" — a stray plural makes the report read like a draft.
+days_label() { if (( $1 == 1 )); then printf '1 day'; else printf '%s days' "$1"; fi; }
+
 # ── Spinner ──────────────────────────────────────────────────────────
+# Only spins on an interactive stdout, so piped/redirected output never gets
+# carriage-return noise. The cleanup trap is installed once, at startup, and is
+# careful never to fail: a failing EXIT trap would override the script's
+# grade-based exit code.
 SPINNER_PID=""
 SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
 
+_cleanup() {
+    if [[ -n "${SPINNER_PID:-}" ]]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
+    fi
+    return 0
+}
+trap _cleanup EXIT
+trap '_cleanup; printf "\r\033[K"; exit 130' INT
+trap '_cleanup; exit 143' TERM
+
 spin_start() {
-    if $QUIET_MODE; then return; fi
+    if $QUIET_MODE || [[ ! -t 1 ]]; then return 0; fi
     local msg="$1"
     (
         i=0
         while true; do
-            printf "\r  ${CYAN}%s${NC} %s  " "${SPINNER_FRAMES[$((i % ${#SPINNER_FRAMES[@]}))]}" "$msg"
+            printf "\r  %b%s%b %s  " "$CYAN" "${SPINNER_FRAMES[$((i % ${#SPINNER_FRAMES[@]}))]}" "$NC" "$msg"
             sleep 0.08
             i=$((i + 1))
         done
     ) &
     SPINNER_PID=$!
-    trap 'kill $SPINNER_PID 2>/dev/null' EXIT
 }
 
 spin_stop() {
     if [[ -n "$SPINNER_PID" ]]; then
-        kill "$SPINNER_PID" 2>/dev/null
+        kill "$SPINNER_PID" 2>/dev/null || true
         wait "$SPINNER_PID" 2>/dev/null || true
         SPINNER_PID=""
-        if ! $QUIET_MODE; then
+        if ! $QUIET_MODE && [[ -t 1 ]]; then
             printf "\r\033[K"
         fi
     fi
+    return 0
 }
 
 check_header() {
-    local num="$1" title="$2"
+    local num="$1" title="$2" cat="$3" pct=0
     CURRENT_CHECK_NUM=$num
     CURRENT_CHECK_TITLE="$title"
-    CURRENT_CHECK_CATEGORY=$(check_category "$num")
+    CURRENT_CHECK_CATEGORY="$cat"
     CHECKS_RUN=$((CHECKS_RUN + 1))
     spin_stop
-    local pct=$(( CHECKS_RUN * 100 / ACTIVE_CHECKS ))
+    (( ACTIVE_CHECKS > 0 )) && pct=$(( CHECKS_RUN * 100 / ACTIVE_CHECKS ))
     qprint "${CYAN}[%s/%s %s%%] %s${NC}\n" "$CHECKS_RUN" "$ACTIVE_CHECKS" "$pct" "$title"
+}
+
+# run_check <number> <category> <title> <function>
+# Applies the --category filter, prints the header, then runs the check body.
+run_check() {
+    should_run_check "$1" || return 0
+    check_header "$1" "$3" "$2"
+    "$4"
 }
 
 # ── Known-good LaunchAgent whitelist ─────────────────────────────────
@@ -479,9 +562,6 @@ is_known_agent() {
 ###############################################################################
 
 check_encryption_filevault() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Disk Encryption (FileVault)"
     if fdesetup status 2>/dev/null | grep -q "On"; then
         pass "FileVault is ON"
     else
@@ -493,15 +573,10 @@ Fix: System Settings > Privacy & Security > FileVault > Turn On
 \`\`\`"
         show_fix "Enable FileVault" \
             "Open System Settings > Privacy & Security > FileVault > Turn On"
-        _record_critical_json "FileVault is OFF" "Your entire disk is readable if the device is lost or stolen."
     fi
 }
 
 check_encryption_timemachine() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Time Machine Backup & Encryption"
-
     local tm_status
     tm_status=$(defaults read /Library/Preferences/com.apple.TimeMachine AutoBackup 2>/dev/null || echo "unknown")
     local tm_dest
@@ -516,7 +591,6 @@ Fix: System Settings > General > Time Machine > Add Backup Destination
 \`\`\`"
         show_fix "Enable Time Machine" \
             "Open System Settings > General > Time Machine > Add Backup Destination"
-        _record_high_json "Time Machine backups are disabled" "Without backups, data loss from ransomware, hardware failure, or accidental deletion is permanent."
     elif echo "$tm_dest" | grep -qi "Not Encrypted\|Encryption State.*None"; then
         medium "Time Machine backup destination is not encrypted" \
 "An unencrypted backup disk exposes all your data if the backup drive is stolen.
@@ -526,7 +600,6 @@ Fix: System Settings > General > Time Machine > select destination > Encrypt Bac
 \`\`\`"
         show_fix "Encrypt Time Machine backup" \
             "Open System Settings > General > Time Machine > select destination > Encrypt Backup"
-        _record_medium_json "Time Machine backup destination is not encrypted" "An unencrypted backup disk exposes all your data if the backup drive is stolen."
     elif [[ -n "$tm_dest" ]]; then
         pass "Time Machine is enabled with encrypted backup"
     else
@@ -539,9 +612,6 @@ Fix: System Settings > General > Time Machine > select destination > Encrypt Bac
 ###############################################################################
 
 check_system_sip() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "System Integrity Protection (SIP)"
     if csrutil status 2>/dev/null | grep -q "enabled"; then
         pass "SIP is enabled"
     else
@@ -555,14 +625,10 @@ Fix: Boot into Recovery Mode (hold Power on Apple Silicon) > Terminal > csrutil 
             "# Boot into Recovery Mode (hold Power on Apple Silicon)" \
             "# Open Terminal from Utilities menu, then run:" \
             "csrutil enable"
-        _record_critical_json "SIP is DISABLED" "System Integrity Protection prevents modification of protected system files and code injection into system processes."
     fi
 }
 
 check_system_gatekeeper() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Gatekeeper & Secure Boot"
     if spctl --status 2>&1 | grep -q "enabled"; then
         pass "Gatekeeper is enabled"
     else
@@ -570,11 +636,14 @@ check_system_gatekeeper() {
 "Unsigned / unnotarised apps can run without any warning.
 
 \`\`\`
-Fix: sudo spctl --master-enable
+Fix: System Settings > Privacy & Security > Security >
+     set 'Allow applications from' to App Store or App Store & known developers
+     (spctl --master-enable was removed in macOS Sequoia and later)
 \`\`\`"
         show_fix "Enable Gatekeeper" \
-            "sudo spctl --master-enable"
-        _record_critical_json "Gatekeeper is DISABLED" "Unsigned / unnotarised apps can run without any warning."
+            "# System Settings > Privacy & Security > Security" \
+            "# Set 'Allow applications from' to App Store & known developers" \
+            "# On macOS 14 and earlier: sudo spctl --master-enable"
     fi
 
     SECURE_BOOT=$(system_profiler SPiBridgeDataType 2>/dev/null | awk -F': ' '/Secure Boot/{print $2}')
@@ -589,14 +658,10 @@ Fix: Boot into Recovery > Startup Security Utility > Full Security
 \`\`\`"
         show_fix "Set Secure Boot to Full Security" \
             "# Boot into Recovery > Startup Security Utility > Full Security"
-        _record_high_json "Secure Boot: $SECURE_BOOT (not Full Security)" "Reduced security allows older or modified kernels to boot."
     fi
 }
 
 check_system_lockdown() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Lockdown Mode"
     LDM_ENABLED=false
     if defaults read /Library/Managed\ Preferences/.GlobalPreferences LDMGlobalEnabled 2>/dev/null | grep -q "1"; then
         LDM_ENABLED=true
@@ -617,15 +682,10 @@ Note: Some functionality will be limited (web fonts, certain message types, etc.
 \`\`\`"
         show_fix "Enable Lockdown Mode" \
             "Open System Settings > Privacy & Security > Lockdown Mode > Turn On"
-        _record_critical_json "Lockdown Mode is OFF" "For a threat model that includes nation-state actors, Lockdown Mode is Apple's primary hardening feature."
     fi
 }
 
 check_system_rsr() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Rapid Security Response"
-
     local rsr
     rsr=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall 2>/dev/null || echo "unknown")
     local rsr_auto
@@ -640,17 +700,12 @@ Fix: System Settings > General > Software Update > Automatic Updates > enable 'I
 \`\`\`"
         show_fix "Enable Rapid Security Responses" \
             "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall -bool true"
-        _record_high_json "Rapid Security Responses may not install automatically" "Apple's Rapid Security Responses patch actively exploited vulnerabilities within hours."
     else
         pass "Rapid Security Responses are enabled"
     fi
 }
 
 check_system_xprotect() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "XProtect Definitions"
-
     local xp_version=""
     local xp_plist="/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Info.plist"
     if [[ -f "$xp_plist" ]]; then
@@ -672,7 +727,7 @@ check_system_xprotect() {
         if [[ "$update_epoch" != "0" ]]; then
             local days_ago=$(( (now_epoch - update_epoch) / 86400 ))
             if (( days_ago > 90 )); then
-                medium "XProtect definitions may be stale (last updated ${days_ago} days ago, version: ${xp_version:-unknown})" \
+                medium "XProtect definitions may be stale (last updated $(days_label "$days_ago") ago, version: ${xp_version:-unknown})" \
 "XProtect is macOS's built-in malware detection. Definitions older than 90 days may miss recent threats.
 
 \`\`\`
@@ -680,9 +735,8 @@ Fix: System Settings > General > Software Update > check for updates
 \`\`\`"
                 show_fix "Update XProtect definitions" \
                     "sudo softwareupdate --background-critical"
-                _record_medium_json "XProtect definitions may be stale (${days_ago} days old)" "XProtect is macOS's built-in malware detection. Definitions older than 90 days may miss recent threats."
             else
-                pass "XProtect definitions are current (${days_ago} days old, version: ${xp_version:-unknown})"
+                pass "XProtect definitions are current ($(days_label "$days_ago") old, version: ${xp_version:-unknown})"
             fi
         else
             pass "XProtect installed (version: ${xp_version:-unknown}, could not determine age)"
@@ -696,15 +750,10 @@ Fix: System Settings > General > Software Update > check for updates
 \`\`\`
 Fix: System Settings > General > Software Update > check for updates
 \`\`\`"
-        _record_medium_json "Could not verify XProtect definitions" "XProtect should be installed on all Macs."
     fi
 }
 
 check_system_kext() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Kernel Extensions"
-
     local extensions
     extensions=$(system_profiler SPExtensionsDataType 2>/dev/null || echo "")
     local third_party=""
@@ -724,17 +773,12 @@ Fix: Review loaded extensions. macOS is moving to System Extensions — ask vend
 \`\`\`"
         show_fix "Review kernel extensions" \
             "# System Settings > General > Login Items & Extensions"
-        _record_medium_json "Third-party kernel extensions loaded" "Kernel extensions run with full system privileges."
     else
         pass "No third-party kernel extensions detected"
     fi
 }
 
 check_system_findmymac() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Find My Mac"
-
     local fmm
     fmm=$(defaults read com.apple.FindMyMac FMMEnabled 2>/dev/null || echo "unknown")
 
@@ -749,7 +793,6 @@ Fix: System Settings > Apple ID > iCloud > Find My Mac > Turn On
 \`\`\`"
         show_fix "Enable Find My Mac" \
             "Open System Settings > Apple ID > iCloud > Find My Mac > Turn On"
-        _record_medium_json "Find My Mac is disabled" "Find My Mac allows you to locate, lock, or erase a lost/stolen Mac remotely."
     else
         pass "Find My Mac: could not determine status (check manually)"
     fi
@@ -760,9 +803,6 @@ Fix: System Settings > Apple ID > iCloud > Find My Mac > Turn On
 ###############################################################################
 
 check_network_firewall() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Firewall & Stealth Mode"
     FW_BIN="/usr/libexec/ApplicationFirewall/socketfilterfw"
     if "$FW_BIN" --getglobalstate 2>/dev/null | grep -q "enabled"; then
         pass "Firewall is enabled"
@@ -775,7 +815,6 @@ Fix: System Settings > Network > Firewall > Turn On
 \`\`\`"
         show_fix "Enable Firewall" \
             "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on"
-        _record_critical_json "Firewall is DISABLED" "Your Mac accepts inbound connections from the network with no filtering."
     fi
 
     if "$FW_BIN" --getstealthmode 2>/dev/null | grep -qi "on\|enabled"; then
@@ -789,15 +828,10 @@ Fix: System Settings > Network > Firewall > Options > Enable Stealth Mode
 \`\`\`"
         show_fix "Enable Stealth Mode" \
             "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode on"
-        _record_high_json "Stealth Mode is OFF" "Your Mac responds to network probes (ping, port scans), making it visible on untrusted networks."
     fi
 }
 
 check_network_exposure() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Network Exposure"
-
     OPEN_PORTS=$(lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null | grep -v "127.0.0.1\|::1" | tail -n +2 || true)
 
     if [[ -n "$OPEN_PORTS" ]]; then
@@ -816,7 +850,6 @@ Fix: Bind services to 127.0.0.1 (localhost) or stop them if not needed.
         show_fix "Stop exposed services (examples)" \
             "brew services stop nginx" \
             "# Or bind to localhost in service configuration"
-        _record_high_json "Services listening on all network interfaces" "Services are reachable by anyone on your local network."
     else
         pass "No services exposed on all interfaces"
     fi
@@ -832,17 +865,12 @@ Fix: sudo sysctl -w net.inet.icmp.bmcastecho=0
 \`\`\`"
         show_fix "Disable ICMP broadcast echo" \
             "sudo sysctl -w net.inet.icmp.bmcastecho=0"
-        _record_high_json "ICMP broadcast echo is enabled" "Your machine responds to broadcast pings."
     else
         pass "ICMP broadcast echo disabled"
     fi
 }
 
 check_network_dns() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "DNS & Network"
-
     DNS_SERVERS=$(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/{print $3}' | head -2 | sort -u | tr '\n' ', ' | sed 's/,$//')
     KNOWN_GOOD="1.1.1.1|1.0.0.1|8.8.8.8|8.8.4.4|9.9.9.9|149.112.112.112"
     if echo "$DNS_SERVERS" | grep -qE "$KNOWN_GOOD"; then
@@ -857,11 +885,9 @@ Fix: System Settings > Network > Wi-Fi > Details > DNS > add 1.1.1.1 and 1.0.0.1
 \`\`\`"
         show_fix "Set DNS to privacy-respecting providers" \
             "networksetup -setdnsservers Wi-Fi 1.1.1.1 1.0.0.1"
-        _record_medium_json "DNS servers: $DNS_SERVERS" "Consider using encrypted DNS to prevent DNS snooping."
     else
         medium "Could not determine DNS servers" \
 "Verify DNS configuration manually."
-        _record_medium_json "Could not determine DNS servers" "Verify DNS configuration manually."
     fi
 
     HOSTS_EXTERNAL=$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' /etc/hosts 2>/dev/null | grep -v '127.0.0.1\|255.255.255.255\|0.0.0.0' || true)
@@ -877,7 +903,6 @@ Fix: Remove production IPs from /etc/hosts. Use a VPN + private DNS instead.
 \`\`\`"
         show_fix "Edit /etc/hosts to remove external IPs" \
             "sudo nano /etc/hosts"
-        _record_high_json "External/production IPs found in /etc/hosts" "Your /etc/hosts contains non-local IP addresses."
     else
         pass "No external IPs in /etc/hosts"
     fi
@@ -897,7 +922,6 @@ Fix: Enable your VPN, especially on untrusted networks.
         show_fix "Enable your VPN" \
             "# Start your VPN client or connect via:" \
             "scutil --nc start 'VPN Connection Name'"
-        _record_medium_json "VPN configurations exist but no VPN appears to be running" "You have VPN software installed but it's not currently active."
     else
         medium "No VPN detected" \
 "No VPN connections or processes found. Use a VPN on untrusted networks.
@@ -905,15 +929,10 @@ Fix: Enable your VPN, especially on untrusted networks.
 \`\`\`
 Fix: Install and configure a trusted VPN provider.
 \`\`\`"
-        _record_medium_json "No VPN detected" "No VPN connections or processes found."
     fi
 }
 
 check_network_wifi() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Wi-Fi Auto-Join for Open Networks"
-
     ASK_TO_JOIN=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.airport.preferences JoinModeFallback 2>/dev/null || \
         defaults read com.apple.airport.preferences JoinModeFallback 2>/dev/null || echo "unknown")
 
@@ -928,17 +947,12 @@ Fix: System Settings > Wi-Fi > Ask to Join Networks > 'Ask'
         show_fix "Disable auto-join for open networks" \
             "# System Settings > Wi-Fi > Ask to Join Networks > 'Ask'" \
             "sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.airport.preferences JoinModeFallback -string 'Prompt'"
-        _record_high_json "Wi-Fi is set to auto-join open networks" "Your Mac will automatically connect to any open Wi-Fi network."
     else
         pass "Wi-Fi auto-join for open networks: not enabled (or set to Ask)"
     fi
 }
 
 check_network_internet_sharing() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Internet Sharing"
-
     local nat_enabled
     nat_enabled=$(defaults read /Library/Preferences/SystemConfiguration/com.apple.nat NAT 2>/dev/null | grep -c "Enabled = 1" || true)
 
@@ -951,17 +965,12 @@ Fix: System Settings > General > Sharing > Internet Sharing > Turn Off
 \`\`\`"
         show_fix "Disable Internet Sharing" \
             "Open System Settings > General > Sharing > Internet Sharing > Turn Off"
-        _record_high_json "Internet Sharing is enabled" "Your Mac is acting as a network router."
     else
         pass "Internet Sharing is disabled"
     fi
 }
 
 check_network_wake() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Wake on Network Access"
-
     local womp
     womp=$(pmset -g 2>/dev/null | awk '/womp/{print $2}' || echo "unknown")
     if [[ "$womp" == "unknown" ]] || [[ -z "$womp" ]]; then
@@ -978,7 +987,6 @@ Fix: System Settings > Battery > Options > Wake for network access > Never
 \`\`\`"
         show_fix "Disable Wake on Network Access" \
             "sudo pmset -a womp 0"
-        _record_medium_json "Wake on Network Access is enabled" "Your Mac can be woken remotely via network traffic."
     else
         pass "Wake on Network Access is disabled"
     fi
@@ -989,10 +997,6 @@ Fix: System Settings > Battery > Options > Wake for network access > Never
 ###############################################################################
 
 check_sharing_services() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Sharing Services"
-
     # AirDrop
     AIRDROP_MODE=$(defaults read com.apple.sharingd DiscoverableMode 2>/dev/null || echo "unknown")
     if [[ "$AIRDROP_MODE" == "Everyone" ]]; then
@@ -1004,7 +1008,6 @@ Fix: System Settings > General > AirDrop & Handoff > AirDrop > 'Contacts Only' o
 \`\`\`"
         show_fix "Set AirDrop to Contacts Only" \
             "defaults write com.apple.sharingd DiscoverableMode -string 'Contacts Only'"
-        _record_critical_json "AirDrop is set to 'Everyone'" "Your Mac is discoverable by any nearby device."
     elif [[ "$AIRDROP_MODE" == "Off" ]]; then
         pass "AirDrop is OFF"
     else
@@ -1021,7 +1024,6 @@ Fix: System Settings > General > Sharing > Disable 'Screen Sharing'
 \`\`\`"
         show_fix "Disable Screen Sharing" \
             "sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.screensharing.plist"
-        _record_high_json "Screen Sharing is enabled" "Allows remote VNC-like access to your desktop."
     else
         pass "Screen Sharing is disabled"
     fi
@@ -1036,7 +1038,6 @@ Fix: System Settings > General > Sharing > Disable 'File Sharing'
 \`\`\`"
         show_fix "Disable File Sharing" \
             "sudo launchctl unload -w /System/Library/LaunchDaemons/com.apple.smbd.plist"
-        _record_high_json "File Sharing (SMB) is enabled" "Exposes file shares on the network."
     else
         pass "File Sharing (SMB) is disabled"
     fi
@@ -1055,7 +1056,6 @@ Fix: System Settings > General > Sharing > Disable 'Remote Management'
 \`\`\`"
         show_fix "Disable Remote Management (ARD)" \
             "sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -deactivate -configure -access -off"
-        _record_critical_json "Remote Management (ARD) is loaded" "Apple Remote Desktop agent is running."
     else
         pass "Remote Management (ARD) is disabled"
     fi
@@ -1072,17 +1072,12 @@ Fix: System Settings > General > Sharing > Disable 'Remote Login'
 \`\`\`"
         show_fix "Disable Remote Login" \
             "sudo systemsetup -setremotelogin off"
-        _record_high_json "Remote Login (SSH) is enabled" "SSH access is available."
     else
         pass "Remote Login (SSH) is disabled"
     fi
 }
 
 check_sharing_remote_apple_events() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Remote Apple Events"
-
     local rae
     rae=$(systemsetup -getremoteappleevents 2>/dev/null || echo "")
     if [[ -z "$rae" ]]; then
@@ -1102,17 +1097,12 @@ Fix: System Settings > General > Sharing > Remote Apple Events > Turn Off
 \`\`\`"
         show_fix "Disable Remote Apple Events" \
             "sudo systemsetup -setremoteappleevents off"
-        _record_high_json "Remote Apple Events are enabled" "Remote Apple Events allow other computers to send AppleScript commands to this Mac."
     else
         pass "Remote Apple Events are disabled"
     fi
 }
 
 check_sharing_content_caching() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Content Caching"
-
     local cc
     cc=$(defaults read /Library/Preferences/com.apple.AssetCache.plist Activated 2>/dev/null || echo "0")
 
@@ -1125,17 +1115,12 @@ Fix: System Settings > General > Sharing > Content Caching > Turn Off
 \`\`\`"
         show_fix "Disable Content Caching" \
             "Open System Settings > General > Sharing > Content Caching > Turn Off"
-        _record_medium_json "Content Caching is enabled" "Content Caching shares downloaded Apple content with other devices on your network."
     else
         pass "Content Caching is disabled"
     fi
 }
 
 check_sharing_printer() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Printer Sharing"
-
     local ps
     ps=$(defaults read /Library/Preferences/org.cups.cupsd SharePrinters 2>/dev/null || echo "0")
 
@@ -1148,17 +1133,12 @@ Fix: System Settings > General > Sharing > Printer Sharing > Turn Off
 \`\`\`"
         show_fix "Disable Printer Sharing" \
             "Open System Settings > General > Sharing > Printer Sharing > Turn Off"
-        _record_medium_json "Printer Sharing is enabled" "Shared printers are accessible to other devices on your network."
     else
         pass "Printer Sharing is disabled"
     fi
 }
 
 check_sharing_media() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Media Sharing"
-
     local ms
     ms=$(defaults read com.apple.amp.mediasharingd home-sharing-enabled 2>/dev/null || echo "0")
     local ms2
@@ -1173,17 +1153,12 @@ Fix: System Settings > General > Sharing > Media Sharing > Turn Off all toggles
 \`\`\`"
         show_fix "Disable Media Sharing" \
             "Open System Settings > General > Sharing > Media Sharing > Turn Off"
-        _record_medium_json "Media Sharing is enabled" "Home Sharing or media library sharing exposes your media content on the local network."
     else
         pass "Media Sharing is disabled"
     fi
 }
 
 check_sharing_handoff() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Handoff"
-
     local handoff_allowed="unknown"
     local byhost_dir="$HOME/Library/Preferences/ByHost"
     if [[ -d "$byhost_dir" ]]; then
@@ -1201,7 +1176,6 @@ Fix: System Settings > General > AirDrop & Handoff > Allow Handoff between this 
 \`\`\`"
         show_fix "Disable Handoff" \
             "Open System Settings > General > AirDrop & Handoff > Handoff > Off"
-        _record_medium_json "Handoff is enabled" "Handoff shares activity data between your Apple devices."
     else
         pass "Handoff: could not determine status"
     fi
@@ -1212,10 +1186,6 @@ Fix: System Settings > General > AirDrop & Handoff > Allow Handoff between this 
 ###############################################################################
 
 check_auth_users() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "User Accounts & Authentication"
-
     # Auto-login
     if defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser &>/dev/null; then
         critical "Auto-login is ENABLED" \
@@ -1226,7 +1196,6 @@ Fix: System Settings > Users & Groups > Disable automatic login
 \`\`\`"
         show_fix "Disable auto-login" \
             "sudo defaults delete /Library/Preferences/com.apple.loginwindow autoLoginUser"
-        _record_critical_json "Auto-login is ENABLED" "Anyone who opens the laptop lid gets full access."
     else
         pass "Auto-login is disabled"
     fi
@@ -1243,7 +1212,6 @@ Fix: System Settings > Users & Groups > demote unnecessary admins to Standard
 \`\`\`"
         show_fix "Demote unnecessary admin accounts" \
             "# System Settings > Users & Groups > select user > change to Standard"
-        _record_medium_json "Multiple admin accounts: $ADMIN_USERS" "More admin accounts = larger attack surface."
     else
         pass "Admin users: $ADMIN_USERS"
     fi
@@ -1263,7 +1231,6 @@ Fix: System Settings > Lock Screen > Require password after screen saver begins
 \`\`\`"
         show_fix "Set screen lock to immediate" \
             "sysadminctl -screenLock immediate -password -"
-        _record_medium_json "Screen lock delay is: ${DELAY_INFO}" "An attacker with brief physical access could unlock the machine."
     else
         ASK_PWD=$(defaults read com.apple.screensaver askForPassword 2>/dev/null || echo "unknown")
         ASK_DELAY=$(defaults read com.apple.screensaver askForPasswordDelay 2>/dev/null || echo "unknown")
@@ -1278,7 +1245,6 @@ Fix: System Settings > Lock Screen > Require password: 'Immediately'
 \`\`\`"
             show_fix "Set screen lock to immediate" \
                 "defaults write com.apple.screensaver askForPasswordDelay -int 0"
-            _record_medium_json "Screen lock has a grace period of ${ASK_DELAY}s" "An attacker with brief physical access could unlock the machine."
         else
             medium "Could not confirm screen lock requires password immediately" \
 "Verify manually that password is required immediately on sleep/screensaver.
@@ -1286,7 +1252,6 @@ Fix: System Settings > Lock Screen > Require password: 'Immediately'
 \`\`\`
 Fix: System Settings > Lock Screen > Require password: 'Immediately'
 \`\`\`"
-            _record_medium_json "Could not confirm screen lock requires password immediately" "Verify manually."
         fi
     fi
 
@@ -1302,20 +1267,21 @@ Fix: security set-keychain-settings -t 3600 -l ~/Library/Keychains/login.keychai
 \`\`\`"
         show_fix "Set keychain to lock after 1 hour and on sleep" \
             "security set-keychain-settings -t 3600 -l ~/Library/Keychains/login.keychain-db"
-        _record_high_json "Login keychain has no lock timeout" "Once unlocked at login, your keychain stays unlocked forever."
     else
         pass "Login keychain has a lock timeout configured"
     fi
 }
 
 check_auth_ssh() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "SSH Configuration"
-
     AUTH_KEYS="$HOME/.ssh/authorized_keys"
+    # Count real key lines only: `wc -l` misses a final line with no trailing
+    # newline and counts blanks and comments as keys.
+    KEY_COUNT=0
     if [[ -f "$AUTH_KEYS" ]] && [[ -s "$AUTH_KEYS" ]]; then
-        KEY_COUNT=$(wc -l < "$AUTH_KEYS" | tr -d ' ')
+        KEY_COUNT=$(grep -cvE '^[[:space:]]*(#|$)' "$AUTH_KEYS" 2>/dev/null || true)
+        [[ "$KEY_COUNT" =~ ^[0-9]+$ ]] || KEY_COUNT=0
+    fi
+    if (( KEY_COUNT > 0 )); then
         high "$KEY_COUNT key(s) in authorized_keys — verify they are all yours" \
 "Any key listed here grants passwordless SSH access to this machine.
 
@@ -1325,30 +1291,26 @@ Fix: Review ~/.ssh/authorized_keys and remove any unrecognised keys
         show_fix "Review authorized_keys" \
             "cat ~/.ssh/authorized_keys" \
             "# Remove unrecognised keys with a text editor"
-        _record_high_json "$KEY_COUNT key(s) in authorized_keys" "Any key listed here grants passwordless SSH access to this machine."
     else
         pass "No authorized_keys file (or empty)"
     fi
 
     SSH_DIR_PERMS=$(stat -f "%Lp" ~/.ssh 2>/dev/null || echo "")
     if [[ -n "$SSH_DIR_PERMS" && "$SSH_DIR_PERMS" != "700" ]]; then
+        # shellcheck disable=SC2088  # the tilde is display text, not a path
         medium "~/.ssh directory permissions are $SSH_DIR_PERMS (should be 700)" \
 "\`\`\`
 Fix: chmod 700 ~/.ssh
 \`\`\`"
         show_fix "Fix ~/.ssh permissions" \
             "chmod 700 ~/.ssh"
-        _record_medium_json "~/.ssh directory permissions are $SSH_DIR_PERMS (should be 700)" "Fix permissions to 700."
     elif [[ -n "$SSH_DIR_PERMS" ]]; then
+        # shellcheck disable=SC2088  # the tilde is display text, not a path
         pass "~/.ssh permissions are 700"
     fi
 }
 
 check_auth_screensaver() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Screen Saver Timeout"
-
     local idle_time
     idle_time=$(defaults read com.apple.screensaver idleTime 2>/dev/null || echo "0")
 
@@ -1361,7 +1323,6 @@ Fix: System Settings > Lock Screen > 'Start Screen Saver when inactive' > set to
 \`\`\`"
         show_fix "Set screen saver timeout" \
             "defaults write com.apple.screensaver idleTime -int 300"
-        _record_medium_json "Screen saver is not configured to activate automatically" "Your screen stays unlocked indefinitely when you walk away."
     elif (( idle_time > 600 )); then
         medium "Screen saver timeout is ${idle_time}s (more than 10 minutes)" \
 "A long timeout leaves your machine accessible if you step away.
@@ -1371,17 +1332,12 @@ Fix: System Settings > Lock Screen > 'Start Screen Saver when inactive' > 5 minu
 \`\`\`"
         show_fix "Reduce screen saver timeout to 5 minutes" \
             "defaults write com.apple.screensaver idleTime -int 300"
-        _record_medium_json "Screen saver timeout is ${idle_time}s (more than 10 minutes)" "A long timeout leaves your machine accessible."
     else
         pass "Screen saver activates after ${idle_time}s"
     fi
 }
 
 check_auth_login_window() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Login Window Configuration"
-
     local issues=""
 
     local show_full
@@ -1406,17 +1362,12 @@ Fix: defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -boo
         show_fix "Harden login window" \
             "sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWFULLNAME -bool true" \
             "sudo defaults write /Library/Preferences/com.apple.loginwindow RetriesUntilHint -int 0"
-        _record_medium_json "Login window configuration could be hardened" "Login window reveals account names or password hints."
     else
         pass "Login window configuration is hardened"
     fi
 }
 
 check_auth_touchid() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Touch ID"
-
     TOUCHID_HW=$(biometric -s 2>/dev/null || system_profiler SPiBridgeDataType 2>/dev/null | grep -i "fingerprint" || echo "")
     TOUCHID_ENROLLED=$(bioutil -c -s 2>/dev/null || echo "")
 
@@ -1431,7 +1382,6 @@ Fix: System Settings > Touch ID & Password > Add a Fingerprint
 \`\`\`"
         show_fix "Enroll a fingerprint in Touch ID" \
             "Open System Settings > Touch ID & Password > Add a Fingerprint"
-        _record_medium_json "Touch ID hardware present but no fingerprints enrolled" "Touch ID adds a strong physical access control layer."
     elif [[ -n "$TOUCHID_HW" ]]; then
         BIOUTIL_OUTPUT=$(bioutil -rs 2>/dev/null || echo "")
         if echo "$BIOUTIL_OUTPUT" | grep -qi "count.*[1-9]\|user.*template"; then
@@ -1445,7 +1395,6 @@ Fix: System Settings > Touch ID & Password > Add a Fingerprint
 \`\`\`"
             show_fix "Enroll a fingerprint in Touch ID" \
                 "Open System Settings > Touch ID & Password > Add a Fingerprint"
-            _record_medium_json "Touch ID may not be enrolled" "Could not confirm fingerprint enrollment."
         fi
     else
         pass "Touch ID: not available on this hardware (skipped)"
@@ -1453,10 +1402,6 @@ Fix: System Settings > Touch ID & Password > Add a Fingerprint
 }
 
 check_auth_usb() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "USB Restricted Mode"
-
     ACCESSORY_SECURITY=$(defaults read /Library/Preferences/com.apple.security USBRestrictedMode 2>/dev/null || echo "unknown")
 
     if [[ "$ACCESSORY_SECURITY" == "0" ]]; then
@@ -1468,7 +1413,6 @@ Fix: System Settings > Privacy & Security > Allow accessories to connect > 'Ask 
 \`\`\`"
         show_fix "Enable USB Restricted Mode" \
             "Open System Settings > Privacy & Security > Allow accessories to connect > 'Ask for New Accessories'"
-        _record_high_json "USB Restricted Mode is DISABLED" "USB accessories can connect even when your Mac is locked."
     else
         pass "USB Restricted Mode: accessories require approval or device is unlocked"
     fi
@@ -1479,15 +1423,10 @@ Fix: System Settings > Privacy & Security > Allow accessories to connect > 'Ask 
 ###############################################################################
 
 check_privacy_location() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Location Services"
-
-    LOCATION_ENABLED="unknown"
-    LOCATION_ENABLED=$(sudo -n defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || echo "unknown")
-    if [[ "$LOCATION_ENABLED" == "unknown" ]]; then
-        LOCATION_ENABLED=$(defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || echo "unknown")
-    fi
+    # NOTE: locationd's plist is root-owned. We deliberately do NOT try sudo —
+    # the audit must never escalate privileges — and fall back to whether the
+    # locationd daemon is loaded.
+    LOCATION_ENABLED=$(defaults read /var/db/locationd/Library/Preferences/ByHost/com.apple.locationd LocationServicesEnabled 2>/dev/null || echo "unknown")
     if [[ "$LOCATION_ENABLED" == "unknown" ]]; then
         if launchctl list com.apple.locationd &>/dev/null; then
             LOCATION_ENABLED="1"
@@ -1506,7 +1445,6 @@ Fix: System Settings > Privacy & Security > Location Services > review app acces
 \`\`\`"
         show_fix "Review Location Services settings" \
             "Open System Settings > Privacy & Security > Location Services"
-        _record_medium_json "Location Services are enabled globally" "Location Services allow apps to access your physical location."
     elif [[ "$LOCATION_ENABLED" == "0" ]]; then
         pass "Location Services are disabled"
     else
@@ -1515,10 +1453,6 @@ Fix: System Settings > Privacy & Security > Location Services > review app acces
 }
 
 check_privacy_analytics() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Analytics & Telemetry Sharing"
-
     ANALYTICS_ISSUES=""
 
     SHARE_ANALYTICS=$(defaults read /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist AutoSubmit 2>/dev/null || echo "unknown")
@@ -1550,17 +1484,12 @@ Fix: System Settings > Privacy & Security > Analytics & Improvements > disable a
             "defaults write '/Library/Application Support/CrashReporter/DiagnosticMessagesHistory.plist' AutoSubmit -bool false" \
             "defaults write '/Library/Application Support/CrashReporter/DiagnosticMessagesHistory.plist' ThirdPartyDataSubmit -bool false" \
             "defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 0"
-        _record_medium_json "Analytics & telemetry sharing is enabled" "Telemetry sharing options are active."
     else
         pass "Analytics & telemetry sharing appears disabled"
     fi
 }
 
 check_privacy_bluetooth() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Bluetooth Discoverability"
-
     BT_INFO=$(system_profiler SPBluetoothDataType 2>/dev/null || true)
     BT_POWER="unknown"
     if echo "$BT_INFO" | grep -qi "State:.*On\|Power:.*On\|Bluetooth.*On"; then
@@ -1586,7 +1515,6 @@ Fix: System Settings > Bluetooth > Turn off when not in use
             show_fix "Turn off Bluetooth (if not needed)" \
                 "sudo defaults write /Library/Preferences/com.apple.Bluetooth ControllerPowerState -int 0" \
                 "sudo killall -HUP bluetoothd"
-            _record_high_json "Bluetooth is ON and discoverable" "Your Mac is visible to all nearby Bluetooth devices."
         else
             pass "Bluetooth is ON but not discoverable"
         fi
@@ -1600,10 +1528,6 @@ Fix: System Settings > Bluetooth > Turn off when not in use
 }
 
 check_privacy_siri() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Siri Voice Trigger"
-
     local siri_voice
     siri_voice=$(defaults read com.apple.Siri VoiceTriggerUserEnabled 2>/dev/null || echo "unknown")
     if [[ "$siri_voice" == "1" ]]; then
@@ -1615,7 +1539,6 @@ Fix: System Settings > Siri & Spotlight > Disable 'Listen for \"Hey Siri\"'
 \`\`\`"
         show_fix "Disable Hey Siri voice trigger" \
             "defaults write com.apple.Siri VoiceTriggerUserEnabled -bool false"
-        _record_medium_json "'Hey Siri' voice trigger is enabled" "Always-on microphone listening is a privacy concern."
     elif [[ "$siri_voice" == "0" ]]; then
         pass "'Hey Siri' voice trigger is disabled"
     else
@@ -1628,10 +1551,6 @@ Fix: System Settings > Siri & Spotlight > Disable 'Listen for \"Hey Siri\"'
 ###############################################################################
 
 check_software_updates() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Software Updates"
-
     AUTO_CHECK=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null || echo "missing")
     AUTO_DL=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload 2>/dev/null || echo "0")
     CRITICAL_INSTALL=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall 2>/dev/null || echo "0")
@@ -1657,30 +1576,75 @@ Fix: System Settings > General > Software Update > Automatic Updates > enable al
             "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool true" \
             "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall -bool true" \
             "sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool true"
-        _record_high_json "Automatic security updates not fully enabled" "Critical patches may not be installed automatically."
     fi
 
-    PENDING=$(softwareupdate -l 2>&1)
-    if echo "$PENDING" | grep -q "No new software available"; then
-        pass "macOS is up to date"
-    else
-        high "Pending software updates available" \
+    # ── Pending updates ──
+    # `softwareupdate -l` contacts Apple's update servers, so it only runs with
+    # an explicit --online. Offline we read the values macOS itself cached at
+    # its last check, which is enough to spot a machine that is behind.
+    if $ONLINE_MODE; then
+        PENDING=$(softwareupdate -l 2>&1 || true)
+        if echo "$PENDING" | grep -q "No new software available"; then
+            pass "macOS is up to date (checked with Apple)"
+        else
+            high "Pending software updates available" \
 "$PENDING
 
 \`\`\`
 Fix: softwareupdate --install --all
 \`\`\`"
-        show_fix "Install pending updates" \
-            "sudo softwareupdate --install --all"
-        _record_high_json "Pending software updates available" "Updates are available for installation."
+            show_fix "Install pending updates" \
+                "sudo softwareupdate --install --all"
+        fi
+    else
+        # RecommendedUpdates is the authoritative cached list. The scalar
+        # LastRecommendedUpdatesAvailable is only a fallback: it is known to go
+        # stale and keep reporting 1 after the update has been installed.
+        CACHED_PENDING="unknown"
+        REC_UPDATES=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate RecommendedUpdates 2>/dev/null || echo "")
+        if [[ -n "$REC_UPDATES" ]]; then
+            CACHED_PENDING=$(printf '%s\n' "$REC_UPDATES" | grep -c 'Identifier' || true)
+        else
+            CACHED_PENDING=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate LastRecommendedUpdatesAvailable 2>/dev/null || echo "unknown")
+        fi
+        LAST_CHECK=$(defaults read /Library/Preferences/com.apple.SoftwareUpdate LastSuccessfulDate 2>/dev/null || echo "")
+        CHECK_AGE_DAYS=""
+        if [[ -n "$LAST_CHECK" ]]; then
+            LAST_CHECK_EPOCH=$(date -j -f "%Y-%m-%d %H:%M:%S %z" "$LAST_CHECK" +%s 2>/dev/null || echo "")
+            if [[ -n "$LAST_CHECK_EPOCH" ]]; then
+                CHECK_AGE_DAYS=$(( ( $(date +%s) - LAST_CHECK_EPOCH ) / 86400 ))
+            fi
+        fi
+
+        if [[ "$CACHED_PENDING" =~ ^[0-9]+$ ]] && (( CACHED_PENDING > 0 )); then
+            high "${CACHED_PENDING} pending update(s) at macOS's last check" \
+"macOS recorded ${CACHED_PENDING} recommended update(s) as available the last time it checked${CHECK_AGE_DAYS:+ ($(days_label "$CHECK_AGE_DAYS") ago)}.
+
+\`\`\`
+Fix: softwareupdate --install --all
+     Re-run with --online to query Apple for the current list
+\`\`\`"
+            show_fix "Install pending updates" \
+                "sudo softwareupdate --install --all"
+        elif [[ -n "$CHECK_AGE_DAYS" ]] && (( CHECK_AGE_DAYS > 30 )); then
+            medium "macOS has not checked for updates in $(days_label "$CHECK_AGE_DAYS")" \
+"A stale update check means a pending security patch can go unnoticed.
+
+\`\`\`
+Fix: System Settings > General > Software Update
+     Or: softwareupdate -l
+\`\`\`"
+            show_fix "Check for updates" \
+                "softwareupdate -l"
+        elif [[ "$CACHED_PENDING" == "unknown" ]]; then
+            pass "Pending updates: no cached result (run with --online to query Apple)"
+        else
+            pass "No pending updates at macOS's last check${CHECK_AGE_DAYS:+ ($(days_label "$CHECK_AGE_DAYS") ago)}"
+        fi
     fi
 }
 
 check_software_review() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Installed Software & Persistence"
-
     # ── Offensive / dual-use tools ──
     OFFENSIVE_TOOLS=""
     for tool in bettercap mitmproxy nmap wireshark sherlock hydra john hashcat metasploit msfconsole aircrack-ng; do
@@ -1706,13 +1670,21 @@ Fix: Uninstall any you're not actively using. Keep them in a VM if needed for se
         show_fix "Uninstall unused offensive tools (example)" \
             "brew uninstall nmap" \
             "# Or remove from /Applications"
-        _record_medium_json "Offensive / dual-use security tools installed" "These tools increase attack surface."
     else
         pass "No offensive tools detected"
     fi
 
     # ── Third-party LaunchDaemons ──
-    THIRD_PARTY_DAEMONS=$(ls /Library/LaunchDaemons/ 2>/dev/null | grep -v '^com.apple' || true)
+    # A glob rather than `ls | grep`: a daemon plist with a newline in its
+    # name would otherwise be split into two bogus entries.
+    THIRD_PARTY_DAEMONS=""
+    for plist in /Library/LaunchDaemons/*; do
+        [[ -e "$plist" ]] || continue
+        plist_name="${plist##*/}"
+        case "$plist_name" in com.apple*) continue ;; esac
+        THIRD_PARTY_DAEMONS="${THIRD_PARTY_DAEMONS}${plist_name}\n"
+    done
+    THIRD_PARTY_DAEMONS=$(printf '%b' "$THIRD_PARTY_DAEMONS")
     if [[ -n "$THIRD_PARTY_DAEMONS" ]]; then
         DAEMON_LIST=$(echo "$THIRD_PARTY_DAEMONS" | sed 's/^/  - /')
 
@@ -1746,7 +1718,6 @@ ls /Library/LaunchDaemons/com.teamviewer* 2>/dev/null && echo 'STILL PRESENT' ||
 \`\`\`"
             show_fix "Uninstall TeamViewer (run this single block)" \
                 "osascript -e 'quit app \"TeamViewer\"' 2>/dev/null; sudo launchctl unload /Library/LaunchDaemons/com.teamviewer.*.plist 2>/dev/null; sudo rm -f /Library/LaunchDaemons/com.teamviewer.* && sudo rm -f /Library/PrivilegedHelperTools/com.teamviewer.Helper && sudo rm -rf '/Library/Application Support/TeamViewer' && sudo rm -rf /Applications/TeamViewer.app && rm -rf ~/Library/Application\\ Support/TeamViewer ~/Library/Caches/com.teamviewer.* ~/Library/Preferences/com.teamviewer* ~/Library/Logs/TeamViewer; echo 'TeamViewer removed.'"
-            _record_critical_json "TeamViewer LaunchDaemons are installed" "TeamViewer has persistent system-level daemons running as root."
         else
             medium "Third-party LaunchDaemons found (run as root)" \
 "Review these for legitimacy — any of them could be a persistence backdoor:
@@ -1761,7 +1732,6 @@ Fix: Investigate each one. Remove any that are not needed:
             show_fix "Remove unwanted LaunchDaemons (example)" \
                 "sudo launchctl unload /Library/LaunchDaemons/<plist-name>" \
                 "sudo rm /Library/LaunchDaemons/<plist-name>"
-            _record_medium_json "Third-party LaunchDaemons found (run as root)" "Review these for legitimacy."
         fi
     else
         pass "No third-party LaunchDaemons"
@@ -1798,7 +1768,6 @@ Fix: Review each one. Remove unneeded agents:
             show_fix "Remove unwanted LaunchAgents (example)" \
                 "launchctl unload ~/Library/LaunchAgents/<plist-name>" \
                 "rm ~/Library/LaunchAgents/<plist-name>"
-            _record_medium_json "$UNKNOWN_COUNT unknown user LaunchAgent(s) found" "Review for legitimacy."
         else
             pass "$AGENT_COUNT user LaunchAgents (all known/whitelisted)"
         fi
@@ -1819,7 +1788,6 @@ Fix: Review with: crontab -l
         show_fix "Review cron jobs" \
             "crontab -l" \
             "# Edit with: crontab -e"
-        _record_medium_json "Cron jobs found for current user" "Review cron jobs for legitimacy."
     else
         pass "No cron jobs"
     fi
@@ -1846,7 +1814,6 @@ Fix: chmod 600 \"$CA_KEY\"
 \`\`\`"
                 show_fix "Fix mkcert CA key permissions" \
                     "chmod 600 \"$CA_KEY\""
-                _record_high_json "mkcert root CA key has loose permissions ($KEY_PERMS)" "mkcert has installed a local root CA."
             else
                 pass "mkcert CA key permissions are 600"
             fi
@@ -1857,10 +1824,6 @@ Fix: chmod 600 \"$CA_KEY\"
 }
 
 check_software_safari() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Safari Safe File Auto-Open"
-
     local auto_open
     auto_open=$(defaults read com.apple.Safari AutoOpenSafeDownloads 2>/dev/null || echo "unknown")
 
@@ -1873,17 +1836,12 @@ Fix: Safari > Settings > General > Uncheck 'Open safe files after downloading'
 \`\`\`"
         show_fix "Disable Safari auto-open" \
             "defaults write com.apple.Safari AutoOpenSafeDownloads -bool false"
-        _record_medium_json "Safari auto-opens 'safe' files after downloading" "Malicious files disguised as safe types can auto-execute."
     else
         pass "Safari does not auto-open downloaded files"
     fi
 }
 
 check_software_secure_keyboard() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Secure Keyboard Entry (Terminal)"
-
     local ske
     ske=$(defaults read com.apple.Terminal SecureKeyboardEntry 2>/dev/null || echo "unknown")
 
@@ -1899,17 +1857,12 @@ Fix: Terminal > Secure Keyboard Entry (menu bar) > Enable
 \`\`\`"
         show_fix "Enable Secure Keyboard Entry" \
             "defaults write com.apple.Terminal SecureKeyboardEntry -bool true"
-        _record_medium_json "Secure Keyboard Entry is disabled in Terminal" "Other applications can intercept keystrokes typed in Terminal."
     else
         pass "Secure Keyboard Entry: could not determine (may use a different terminal)"
     fi
 }
 
 check_software_docker() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Docker Daemons"
-
     if daemon_loaded com.docker.vmnetd 2>/dev/null || daemon_loaded com.docker.socket 2>/dev/null; then
         medium "Docker system daemons are installed (run as root)" \
 "Docker's vmnetd and socket daemon run as root-level LaunchDaemons. Containers can be used for privilege escalation.
@@ -1920,7 +1873,6 @@ Fix: Only run Docker when actively needed. Consider lighter alternatives like Co
         show_fix "Consider lighter alternatives" \
             "# Stop Docker Desktop when not in use" \
             "# Consider Colima: brew install colima"
-        _record_medium_json "Docker system daemons are installed (run as root)" "Docker daemons run as root-level LaunchDaemons."
     else
         pass "No Docker system daemons detected"
     fi
@@ -1931,10 +1883,6 @@ Fix: Only run Docker when actively needed. Consider lighter alternatives like Co
 ###############################################################################
 
 check_encryption_recovery_key() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "FileVault Recovery Key"
-
     if ! fdesetup status 2>/dev/null | grep -q "On"; then
         pass "FileVault is off (recovery key check not applicable)"
         return
@@ -1958,7 +1906,6 @@ Fix: sudo fdesetup changerecovery -personal
 \`\`\`"
         show_fix "Create a FileVault recovery key" \
             "sudo fdesetup changerecovery -personal"
-        _record_high_json "No FileVault recovery key found" "Without a recovery key, if you forget your password you will permanently lose access to all data."
     fi
 }
 
@@ -1967,10 +1914,6 @@ Fix: sudo fdesetup changerecovery -personal
 ###############################################################################
 
 check_system_profiles() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Configuration Profiles"
-
     local mdm_status
     mdm_status=$(profiles status -type enrollment 2>&1 || echo "")
 
@@ -1985,7 +1928,6 @@ Fix: If unexpected on a personal device:
 \`\`\`"
         show_fix "Review MDM enrollment" \
             "profiles status -type enrollment"
-        _record_medium_json "Device is enrolled in MDM" "An MDM server can remotely manage settings on this Mac."
     else
         pass "Device is not enrolled in MDM"
     fi
@@ -2007,17 +1949,12 @@ Fix: System Settings > General > Device Management > review each profile
 \`\`\`"
         show_fix "Review configuration profiles" \
             "profiles list"
-        _record_medium_json "Configuration profiles installed" "Review installed configuration profiles for legitimacy."
     else
         pass "No configuration profiles installed"
     fi
 }
 
 check_system_mrt() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "MRT / XProtect Remediator"
-
     local found=false
 
     # XProtect Remediator (macOS Ventura+) supersedes MRT
@@ -2048,7 +1985,6 @@ Fix: System Settings > General > Software Update > check for updates
 \`\`\`"
         show_fix "Check for system updates" \
             "sudo softwareupdate --background-critical"
-        _record_medium_json "Neither MRT nor XProtect Remediator found" "macOS malware removal tools should be installed automatically."
     fi
 }
 
@@ -2057,10 +1993,6 @@ Fix: System Settings > General > Software Update > check for updates
 ###############################################################################
 
 check_auth_password_policy() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Password Policy"
-
     local policy_xml
     policy_xml=$(pwpolicy getaccountpolicies 2>/dev/null || echo "")
 
@@ -2076,7 +2008,6 @@ Fix: For personal use: set a strong password (12+ characters, mixed types)
         show_fix "Set a strong password" \
             "# System Settings > Touch ID & Password > Change Password" \
             "# Recommend: 12+ characters with uppercase, lowercase, numbers, symbols"
-        _record_medium_json "No custom password policy configured" "macOS defaults allow any password length and complexity."
     else
         pass "Password policy is configured"
     fi
@@ -2087,10 +2018,6 @@ Fix: For personal use: set a strong password (12+ characters, mixed types)
 ###############################################################################
 
 check_privacy_tcc() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Privacy Permissions (TCC)"
-
     local tcc_db="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
     local issues=""
     local tcc_readable=false
@@ -2127,7 +2054,6 @@ Fix: System Settings > Privacy & Security > review each category
 \`\`\`"
         show_fix "Review privacy permissions" \
             "Open System Settings > Privacy & Security > review Camera, Microphone, Screen Recording, Accessibility, Full Disk Access"
-        _record_medium_json "Sensitive privacy permissions granted to apps" "Review high-risk privacy permissions."
     elif $tcc_readable; then
         pass "No sensitive privacy permission grants detected"
     else
@@ -2140,10 +2066,6 @@ Fix: System Settings > Privacy & Security > review each category
 ###############################################################################
 
 check_software_safari_privacy() {
-    local n=$1
-    if ! should_run_check "$n"; then return; fi
-    check_header "$n" "Safari Privacy & Security"
-
     local issues=""
 
     # Fraudulent website warnings
@@ -2178,172 +2100,76 @@ Fix: Safari > Settings > Privacy > enable tracking prevention
         show_fix "Harden Safari privacy" \
             "defaults write com.apple.Safari WarnAboutFraudulentWebsites -bool true" \
             "defaults write com.apple.Safari SendDoNotTrackHTTPHeader -bool true"
-        _record_medium_json "Safari privacy settings could be improved" "Review Safari privacy configuration."
     else
         pass "Safari privacy settings appear reasonable"
     fi
 }
 
 ###############################################################################
-# MAIN EXECUTION
+# REPORT RENDERERS
 ###############################################################################
 
-# Compute active checks (for progress display)
-ACTIVE_CHECKS=$(count_active_checks)
-if [[ -n "$CATEGORY_FILTER" ]]; then
-    PARTIAL_AUDIT=true
-fi
+# Markdown table cells must not contain a bare pipe.
+md_cell() { printf '%s' "${1//|/\\|}"; }
 
-# ── Header ───────────────────────────────────────────────────────────
-qecho ""
-qprint "${CYAN}╔══════════════════════════════════════════════════════╗${NC}\n"
-qprint "${CYAN}║         macOS Security Audit — %s            ║${NC}\n" "$DATE_STAMP"
-qprint "${CYAN}╚══════════════════════════════════════════════════════╝${NC}\n"
-qecho ""
-
-HW_MODEL=$(sysctl -n hw.model 2>/dev/null || echo "Unknown")
-HW_CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Chip/{print $2}' || echo "Unknown")
-OS_VERSION=$(sw_vers -productVersion 2>/dev/null || echo "Unknown")
-OS_BUILD=$(sw_vers -buildVersion 2>/dev/null || echo "Unknown")
-SERIAL=$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Serial Number/{print $2; exit}' || echo "Unknown")
-
-qprint "  Machine : %s (%s)\n" "$HW_MODEL" "$HW_CHIP"
-qprint "  macOS   : %s (%s)\n" "$OS_VERSION" "$OS_BUILD"
-qprint "  Serial  : %s\n" "$SERIAL"
-if $PARTIAL_AUDIT; then
-    qprint "  Filter  : %s\n" "$CATEGORY_FILTER"
-fi
-qecho ""
-
-spin_start "Running security checks…"
-
-# ── Execute all checks ───────────────────────────────────────────────
-check_encryption_filevault 1
-check_encryption_timemachine 2
-check_system_sip 3
-check_system_gatekeeper 4
-check_system_lockdown 5
-check_system_rsr 6
-check_system_xprotect 7
-check_system_kext 8
-check_system_findmymac 9
-check_network_firewall 10
-check_network_exposure 11
-check_network_dns 12
-check_network_wifi 13
-check_network_internet_sharing 14
-check_network_wake 15
-check_sharing_services 16
-check_sharing_remote_apple_events 17
-check_sharing_content_caching 18
-check_sharing_printer 19
-check_sharing_media 20
-check_sharing_handoff 21
-check_auth_users 22
-check_auth_ssh 23
-check_auth_screensaver 24
-check_auth_login_window 25
-check_auth_touchid 26
-check_auth_usb 27
-check_privacy_location 28
-check_privacy_analytics 29
-check_privacy_bluetooth 30
-check_privacy_siri 31
-check_software_updates 32
-check_software_review 33
-check_software_safari 34
-check_software_secure_keyboard 35
-check_software_docker 36
-check_encryption_recovery_key 37
-check_system_profiles 38
-check_system_mrt 39
-check_auth_password_policy 40
-check_privacy_tcc 41
-check_software_safari_privacy 42
-
-###############################################################################
-# TERMINAL SUMMARY
-###############################################################################
-spin_stop
-GRADE=$(letter_grade $SCORE)
-
-if ! $QUIET_MODE; then
-    echo ""
-    qprint "${CYAN}┌─────────────────────────────────────┐${NC}\n"
-    qprint "${CYAN}│       Security Audit Complete        │${NC}\n"
-    qprint "${CYAN}├────────────┬────────────────────────┤${NC}\n"
-    qprint "${CYAN}│${NC} ${RED}CRITICAL${NC}   ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "${#CRITICALS[@]}"
-    qprint "${CYAN}│${NC} ${YELLOW}HIGH${NC}       ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "${#HIGHS[@]}"
-    qprint "${CYAN}│${NC} ${YELLOW}MEDIUM${NC}     ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "${#MEDIUMS[@]}"
-    qprint "${CYAN}│${NC} ${GREEN}PASS${NC}       ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "${#PASSES[@]}"
-    qprint "${CYAN}├────────────┼────────────────────────┤${NC}\n"
-    qprint "${CYAN}│${NC} Score      ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "$SCORE / 100"
-    qprint "${CYAN}│${NC} Grade      ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "$GRADE"
-    qprint "${CYAN}└────────────┴────────────────────────┘${NC}\n"
+render_json() {
+    local i n fix_json
+    n=${#F_SEV[@]}
+    printf '{\n'
+    printf '  "version": "%s",\n' "$VERSION"
+    printf '  "timestamp": "%s",\n' "$TIMESTAMP"
+    printf '  "machine": {\n'
+    printf '    "model": "%s",\n' "$(json_escape "$HW_MODEL")"
+    printf '    "chip": "%s",\n' "$(json_escape "$HW_CHIP")"
+    printf '    "macos_version": "%s",\n' "$(json_escape "$OS_VERSION")"
+    printf '    "build": "%s",\n' "$(json_escape "$OS_BUILD")"
+    printf '    "serial": "%s"\n' "$(json_escape "$SERIAL_OUT")"
+    printf '  },\n'
+    printf '  "score": %d,\n' "$SCORE"
+    printf '  "grade": "%s",\n' "$GRADE"
+    printf '  "offline": %s,\n' "$($ONLINE_MODE && printf 'false' || printf 'true')"
+    printf '  "partial_audit": %s,\n' "$PARTIAL_AUDIT"
     if $PARTIAL_AUDIT; then
-        qprint "\n  ${YELLOW}Partial audit — categories: %s${NC}\n" "$CATEGORY_FILTER"
+        printf '  "categories_checked": "%s",\n' "$(json_escape "$CATEGORY_FILTER")"
+    else
+        printf '  "categories_checked": "all",\n'
     fi
-    echo ""
-fi
-
-if $QUIET_MODE; then
-    echo "$GRADE ($SCORE/100)"
-fi
-
-###############################################################################
-# GENERATE REPORT
-###############################################################################
-
-if $JSON_MODE; then
-    # ── JSON report ──────────────────────────────────────────────────
-    {
-        printf '{\n'
-        printf '  "version": "%s",\n' "$VERSION"
-        printf '  "timestamp": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        printf '  "machine": {\n'
-        printf '    "model": "%s",\n' "$(json_escape "$HW_MODEL")"
-        printf '    "chip": "%s",\n' "$(json_escape "$HW_CHIP")"
-        printf '    "macos_version": "%s",\n' "$(json_escape "$OS_VERSION")"
-        printf '    "build": "%s",\n' "$(json_escape "$OS_BUILD")"
-        printf '    "serial": "%s"\n' "$(json_escape "$SERIAL")"
-        printf '  },\n'
-        printf '  "score": %d,\n' "$SCORE"
-        printf '  "grade": "%s",\n' "$GRADE"
-        printf '  "partial_audit": %s,\n' "$PARTIAL_AUDIT"
-        if $PARTIAL_AUDIT; then
-            printf '  "categories_checked": "%s",\n' "$(json_escape "$CATEGORY_FILTER")"
-        else
-            printf '  "categories_checked": "all",\n'
+    printf '  "summary": {\n'
+    printf '    "critical": %d,\n' "${#CRITICALS[@]}"
+    printf '    "high": %d,\n' "${#HIGHS[@]}"
+    printf '    "medium": %d,\n' "${#MEDIUMS[@]}"
+    printf '    "pass": %d,\n' "${#PASSES[@]}"
+    printf '    "checks_run": %d,\n' "$CHECKS_RUN"
+    printf '    "total": %d\n' "$ACTIVE_CHECKS"
+    printf '  },\n'
+    printf '  "findings": [\n'
+    for (( i = 0; i < n; i++ )); do
+        fix_json="null"
+        if [[ -n "${F_FIX[$i]}" ]]; then
+            fix_json="\"$(json_escape "${F_FIX[$i]}")\""
         fi
-        printf '  "summary": {\n'
-        printf '    "critical": %d,\n' "${#CRITICALS[@]}"
-        printf '    "high": %d,\n' "${#HIGHS[@]}"
-        printf '    "medium": %d,\n' "${#MEDIUMS[@]}"
-        printf '    "pass": %d,\n' "${#PASSES[@]}"
-        printf '    "total": %d\n' "$ACTIVE_CHECKS"
-        printf '  },\n'
-        printf '  "findings": [\n'
-        local first=true
-        for finding in "${JSON_FINDINGS[@]}"; do
-            if $first; then
-                first=false
-            else
-                printf ',\n'
-            fi
-            printf '    %s' "$finding"
-        done
-        printf '\n  ]\n'
-        printf '}\n'
-    } > "$OUTPUT_FILE"
-else
-    # ── Markdown report ──────────────────────────────────────────────
-    {
+        printf '    {"check_number":%d,"category":"%s","title":"%s","severity":"%s","summary":"%s","detail":"%s","fix":%s}' \
+            "${F_NUM[$i]}" \
+            "$(json_escape "${F_CAT[$i]}")" \
+            "$(json_escape "${F_TITLE[$i]}")" \
+            "${F_SEV[$i]}" \
+            "$(json_escape "${F_SUMMARY[$i]}")" \
+            "$(json_escape "${F_DETAIL[$i]}")" \
+            "$fix_json"
+        if (( i < n - 1 )); then printf ',\n'; else printf '\n'; fi
+    done
+    printf '  ]\n'
+    printf '}\n'
+}
+
+render_markdown() {
+    local p c h m idx
     cat <<EOF
 # macOS Security Audit Report
 
 **Machine:** ${HW_MODEL} (${HW_CHIP})
 **macOS:** ${OS_VERSION} (${OS_BUILD})
-**Serial:** ${SERIAL}
+**Serial:** ${SERIAL_OUT}
 **Date:** ${DATE_STAMP}
 **Overall Grade:** ${GRADE} (${SCORE}/100)
 EOF
@@ -2351,8 +2177,11 @@ EOF
     if $PARTIAL_AUDIT; then
         printf "\n> **Partial audit** — only categories: %s\n" "$CATEGORY_FILTER"
     fi
+    if ! $ONLINE_MODE; then
+        printf "\n> Run fully offline — no network request was made. Pending-update data comes from the values macOS cached at its own last check.\n"
+    fi
 
-    cat <<EOF
+    cat <<'EOF'
 
 ---
 
@@ -2363,53 +2192,32 @@ EOF
 EOF
 
     for p in "${PASSES[@]}"; do
-        printf "| %s | PASS |\n" "$p"
+        printf "| %s | PASS |\n" "$(md_cell "$p")"
     done
 
     if (( ${#CRITICALS[@]} > 0 )); then
-        cat <<EOF
-
----
-
-## CRITICAL — Fix Immediately
-
-EOF
+        printf '\n---\n\n## CRITICAL — Fix Immediately\n\n'
         idx=1
         for c in "${CRITICALS[@]}"; do
             printf "### %d. %s\n\n" "$idx" "$c"
-            echo ""
             idx=$((idx + 1))
         done
     fi
 
     if (( ${#HIGHS[@]} > 0 )); then
-        cat <<EOF
-
----
-
-## HIGH — Fix Soon
-
-EOF
+        printf '\n---\n\n## HIGH — Fix Soon\n\n'
         idx=1
         for h in "${HIGHS[@]}"; do
             printf "### %d. %s\n\n" "$idx" "$h"
-            echo ""
             idx=$((idx + 1))
         done
     fi
 
     if (( ${#MEDIUMS[@]} > 0 )); then
-        cat <<EOF
-
----
-
-## MEDIUM — Recommended Hardening
-
-EOF
+        printf '\n---\n\n## MEDIUM — Recommended Hardening\n\n'
         idx=1
         for m in "${MEDIUMS[@]}"; do
             printf "### %d. %s\n\n" "$idx" "$m"
-            echo ""
             idx=$((idx + 1))
         done
     fi
@@ -2430,25 +2238,108 @@ EOF
 
 ---
 
-*Generated by [macos-security-audit](https://github.com/fexxdev/macos-security-audit) v${VERSION} on ${DATE_STAMP}*
+*Generated by [macos-security-audit](https://github.com/fexxdev/macos_secuirty_audit) v${VERSION} on ${DATE_STAMP}*
 EOF
+}
 
-    } > "$OUTPUT_FILE"
-fi
+###############################################################################
+# MAIN EXECUTION
+###############################################################################
 
-if ! $QUIET_MODE; then
-    if $JSON_MODE; then
-        qprint "  ${GREEN}JSON report written to: %s${NC}\n" "$OUTPUT_FILE"
-    else
-        qprint "  ${GREEN}Report written to: %s${NC}\n" "$OUTPUT_FILE"
+main() {
+    local entry num cat title fn
+
+    ACTIVE_CHECKS=$(count_active_checks)
+    if [[ -n "$CATEGORY_FILTER" ]]; then
+        PARTIAL_AUDIT=true
     fi
-    qprint "  ${CYAN}Review the report:${NC} cat %s\n" "$OUTPUT_FILE"
-    echo ""
-fi
 
-# ── Exit code based on grade ─────────────────────────────────────────
-case "$GRADE" in
-    A+|A|A-|B+|B|B-) exit 0 ;;
-    C+|C|C-)         exit 1 ;;
-    *)               exit 2 ;;
-esac
+    # ── Header ───────────────────────────────────────────────────────
+    qecho ""
+    qprint "${CYAN}╔══════════════════════════════════════════════════════╗${NC}\n"
+    qprint "${CYAN}║         macOS Security Audit — %s            ║${NC}\n" "$DATE_STAMP"
+    qprint "${CYAN}╚══════════════════════════════════════════════════════╝${NC}\n"
+    qecho ""
+
+    HW_MODEL=$(sysctl -n hw.model 2>/dev/null || echo "Unknown")
+    HW_CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Chip/{print $2}' || echo "Unknown")
+    OS_VERSION=$(sw_vers -productVersion 2>/dev/null || echo "Unknown")
+    OS_BUILD=$(sw_vers -buildVersion 2>/dev/null || echo "Unknown")
+    SERIAL=$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Serial Number/{print $2; exit}' || echo "Unknown")
+    SERIAL_OUT="$SERIAL"
+    $REDACT_MODE && SERIAL_OUT="REDACTED"
+    TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    qprint "  Machine : %s (%s)\n" "$HW_MODEL" "$HW_CHIP"
+    qprint "  macOS   : %s (%s)\n" "$OS_VERSION" "$OS_BUILD"
+    qprint "  Serial  : %s\n" "$SERIAL_OUT"
+    qprint "  Mode    : %s\n" "$($ONLINE_MODE && printf 'online (queries Apple for updates)' || printf 'offline (no network request)')"
+    if $PARTIAL_AUDIT; then
+        qprint "  Filter  : %s\n" "$CATEGORY_FILTER"
+    fi
+    qecho ""
+
+    spin_start "Running security checks…"
+
+    # ── Execute the checks, in registry order ────────────────────────
+    for entry in "${CHECKS[@]}"; do
+        IFS='|' read -r num cat title fn <<< "$entry"
+        run_check "$num" "$cat" "$title" "$fn"
+    done
+
+    spin_stop
+
+    # ── Terminal summary ─────────────────────────────────────────────
+    (( SCORE < 0 )) && SCORE=0
+    GRADE=$(letter_grade "$SCORE")
+
+    if ! $QUIET_MODE; then
+        echo ""
+        qprint "${CYAN}┌─────────────────────────────────────┐${NC}\n"
+        qprint "${CYAN}│       Security Audit Complete        │${NC}\n"
+        qprint "${CYAN}├────────────┬────────────────────────┤${NC}\n"
+        qprint "${CYAN}│${NC} ${RED}CRITICAL${NC}   ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "${#CRITICALS[@]}"
+        qprint "${CYAN}│${NC} ${YELLOW}HIGH${NC}       ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "${#HIGHS[@]}"
+        qprint "${CYAN}│${NC} ${YELLOW}MEDIUM${NC}     ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "${#MEDIUMS[@]}"
+        qprint "${CYAN}│${NC} ${GREEN}PASS${NC}       ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "${#PASSES[@]}"
+        qprint "${CYAN}├────────────┼────────────────────────┤${NC}\n"
+        qprint "${CYAN}│${NC} Score      ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "$SCORE / 100"
+        qprint "${CYAN}│${NC} Grade      ${CYAN}│${NC} %-22s ${CYAN}│${NC}\n" "$GRADE"
+        qprint "${CYAN}└────────────┴────────────────────────┘${NC}\n"
+        if $PARTIAL_AUDIT; then
+            qprint "\n  ${YELLOW}Partial audit — categories: %s${NC}\n" "$CATEGORY_FILTER"
+        fi
+        echo ""
+    else
+        echo "$GRADE ($SCORE/100)"
+    fi
+
+    # ── Report ───────────────────────────────────────────────────────
+    if $JSON_MODE; then
+        render_json > "$OUTPUT_FILE"
+    else
+        render_markdown > "$OUTPUT_FILE"
+    fi
+
+    if ! $QUIET_MODE; then
+        if $JSON_MODE; then
+            qprint "  ${GREEN}JSON report written to: %s${NC}\n" "$OUTPUT_FILE"
+        else
+            qprint "  ${GREEN}Report written to: %s${NC}\n" "$OUTPUT_FILE"
+        fi
+        qprint "  ${CYAN}Review the report:${NC} cat %s\n" "$OUTPUT_FILE"
+        echo ""
+    fi
+
+    # ── Exit code based on grade ─────────────────────────────────────
+    case "$GRADE" in
+        A+|A|A-|B+|B|B-) return 0 ;;
+        C+|C|C-)         return 1 ;;
+        *)               return 2 ;;
+    esac
+}
+
+if [[ "$MSA_LIB_MODE" != "1" ]]; then
+    main
+    exit $?
+fi

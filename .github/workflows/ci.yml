@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint & test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      - name: Show environment
+        run: |
+          sw_vers
+          bash --version | head -1
+          shellcheck --version | sed -n 2p
+
+      # The suite covers syntax, shellcheck, the check registry, the CLI
+      # contract, report rendering and the read-only/offline static guards.
+      - name: Run the test suite
+        run: make check
+
+      # A real audit on the runner: the grade is meaningless on ephemeral
+      # hardware, but the exit code and the JSON shape are not. --redact keeps
+      # the runner's serial out of the log.
+      - name: Smoke run
+        run: |
+          set +e
+          ./bin/macos-security-audit --category encryption,system \
+            --json --redact --quiet --output "$RUNNER_TEMP/report.json"
+          rc=$?
+          set -e
+          case "$rc" in
+            0|1|2) echo "exit $rc — grade-based, as documented" ;;
+            *)     echo "unexpected exit code $rc"; exit 1 ;;
+          esac
+          python3 -m json.tool "$RUNNER_TEMP/report.json" > /dev/null
+          echo "JSON report parses"
+
+  shellcheck-strict:
+    name: shellcheck (style level, advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck -S style bin/macos-security-audit tests/run-tests.sh

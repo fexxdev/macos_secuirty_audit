@@ -1,5 +1,13 @@
 # Comprehensive Overhaul — Design Spec
 
+> **Historical — completed and superseded.** This document describes the v2.0.0
+> overhaul as it was planned on 2026-03-18. It shipped, and v3.0.0 then replaced
+> several of the mechanisms described below: the numeric check-number → category
+> map became the `CHECKS` registry, and the `_record_<severity>_json` dual-call
+> API became a single findings store written by `pass()`/`critical()`/`high()`/
+> `medium()`. Read `CLAUDE.md` for how the script works today; keep this only as
+> a record of the decisions.
+
 **Date:** 2026-03-18
 **Approach:** Phased delivery (3 phases, single-file architecture preserved)
 

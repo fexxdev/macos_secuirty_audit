@@ -1,10 +1,10 @@
 class MacosSecurityAudit < Formula
   desc "Comprehensive macOS security audit with Markdown report generation"
-  homepage "https://github.com/fexxdev/macos-security-audit"
-  url "https://github.com/fexxdev/macos-security-audit/archive/refs/tags/v2.0.0.tar.gz"
+  homepage "https://github.com/fexxdev/macos_secuirty_audit"
+  url "https://github.com/fexxdev/macos_secuirty_audit/archive/refs/tags/v3.0.0.tar.gz"
   # sha256 "UPDATE_WITH_ACTUAL_SHA256_AFTER_RELEASE"
   license "MIT"
-  version "2.0.0"
+  version "3.0.0"
 
   def install
     bin.install "bin/macos-security-audit"
@@ -12,5 +12,8 @@ class MacosSecurityAudit < Formula
 
   test do
     assert_match "macos-security-audit", shell_output("#{bin}/macos-security-audit --help")
+    assert_match version.to_s, shell_output("#{bin}/macos-security-audit --version")
+    # Usage errors must be distinguishable from a bad security grade.
+    shell_output("#{bin}/macos-security-audit --category nonexistent 2>&1", 64)
   end
 end

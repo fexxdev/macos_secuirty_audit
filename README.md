@@ -1,6 +1,11 @@
 # macos-security-audit
 
+[![CI](https://github.com/fexxdev/macos_secuirty_audit/actions/workflows/ci.yml/badge.svg)](https://github.com/fexxdev/macos_secuirty_audit/actions/workflows/ci.yml)
+
 Comprehensive macOS security audit tool that runs 42 checks and generates a Markdown (or JSON) report with a letter grade.
+
+Read-only, offline by default, no dependencies — and the test suite in `tests/`
+enforces all three on every run.
 
 ```
 ╔══════════════════════════════════════════════════════╗
@@ -34,15 +39,15 @@ Comprehensive macOS security audit tool that runs 42 checks and generates a Mark
 ### Homebrew
 
 ```bash
-brew tap fexxdev/macos-security-audit https://github.com/fexxdev/macos-security-audit
+brew tap fexxdev/macos_secuirty_audit https://github.com/fexxdev/macos_secuirty_audit
 brew install macos-security-audit
 ```
 
 ### Make
 
 ```bash
-git clone https://github.com/fexxdev/macos-security-audit.git
-cd macos-security-audit
+git clone https://github.com/fexxdev/macos_secuirty_audit.git
+cd macos_secuirty_audit
 make install          # installs to /usr/local/bin
 # make uninstall      # removes it
 ```
@@ -50,8 +55,8 @@ make install          # installs to /usr/local/bin
 ### Manual
 
 ```bash
-git clone https://github.com/fexxdev/macos-security-audit.git
-cd macos-security-audit
+git clone https://github.com/fexxdev/macos_secuirty_audit.git
+cd macos_secuirty_audit
 ./bin/macos-security-audit
 ```
 
@@ -77,6 +82,12 @@ macos-security-audit --category encryption,network
 # Quiet mode — print only the grade
 macos-security-audit --quiet
 
+# Mask the hardware serial number in the report
+macos-security-audit --redact
+
+# Allow the one check that queries Apple for pending updates
+macos-security-audit --online
+
 # Disable colours (auto-detected when piping)
 macos-security-audit --no-color
 
@@ -85,6 +96,9 @@ macos-security-audit --list-checks
 
 # Print version
 macos-security-audit --version
+
+# Long options also take the --opt=value form
+macos-security-audit --category=network --output=report.md
 
 # Combine flags
 macos-security-audit --show-fix --output report.md
@@ -106,17 +120,46 @@ No interactive prompts, safe to pipe or redirect. Just copy the command you want
 
 ## `--json`
 
-Outputs the report as a JSON object instead of Markdown:
+Outputs the report as a JSON object instead of Markdown. Every finding — passes
+included — appears in `findings`, with the same `--show-fix` command the
+terminal would print:
 
 ```json
 {
-  "version": "2.0.0",
+  "version": "3.0.0",
+  "timestamp": "2026-07-25T09:14:02Z",
+  "machine": { "model": "Mac15,6", "chip": "Apple M3 Pro", "macos_version": "26.5.2", "build": "25F84", "serial": "REDACTED" },
   "score": 82,
   "grade": "B+",
-  "summary": { "critical": 0, "high": 2, "medium": 5, "pass": 35, "total": 42 },
-  "findings": [...]
+  "offline": true,
+  "partial_audit": false,
+  "categories_checked": "all",
+  "summary": { "critical": 0, "high": 2, "medium": 5, "pass": 35, "checks_run": 42, "total": 42 },
+  "findings": [
+    {
+      "check_number": 10,
+      "category": "network",
+      "title": "Firewall & Stealth Mode",
+      "severity": "critical",
+      "summary": "Firewall is DISABLED",
+      "detail": "Your Mac accepts inbound connections from the network with no filtering.",
+      "fix": "Enable Firewall\nsudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on"
+    }
+  ]
 }
 ```
+
+## `--online`
+
+One check — pending software updates — can ask Apple's servers what is
+available. It is **off by default**, so the audit makes no network request at
+all. Without `--online` the check reads the values macOS itself cached at its
+last update check; the report says which mode was used either way.
+
+## `--redact`
+
+Replaces the hardware serial number with `REDACTED` in both report formats. Use
+it when the report is going anywhere but your own disk.
 
 ## `--category`
 
@@ -136,6 +179,11 @@ When filtering, the report includes a "Partial audit" disclaimer.
 | A+, A, A-, B+, B, B- | 0 |
 | C+, C, C- | 1 |
 | D+, D, D-, F | 2 |
+| _invalid usage_ | 64 |
+
+`64` (`EX_USAGE`) is reserved for CLI mistakes — an unknown flag, a missing
+argument, an unwritable output path — so a broken invocation can never be
+mistaken for a bad security grade.
 
 Useful for CI/scripting: `macos-security-audit --quiet && echo "OK" || echo "Issues found"`
 
@@ -243,13 +291,31 @@ The audit produces:
 This project was built with AI assistance ("vibecoded"). Every line of code is open source and auditable. Here's what we do to make sure it's completely free of harm:
 
 - **Read-only by design** — the script only _reads_ system settings. It never changes, writes, or deletes anything on your machine unless you manually copy-paste a fix command yourself.
-- **No network calls** — nothing is phoned home, uploaded, or sent anywhere. The audit runs 100% locally.
+- **Offline by default** — the audit makes no network request. Exactly one check can talk to the network (asking Apple about pending updates) and it only runs when you pass `--online`. Nothing is ever phoned home, uploaded, or sent anywhere in either mode; `tests/run-tests.sh` fails the build if a network client appears anywhere else in the script.
 - **No dependencies** — pure Bash using only standard macOS system utilities (`defaults`, `csrutil`, `fdesetup`, `lsof`, etc.). No pip, no npm, no curl at runtime.
 - **Full source visibility** — the entire tool is a single shell script you can read end-to-end in minutes.
 - **Output stays local** — the Markdown report is written to your working directory. It never leaves your machine.
 - **Deterministic** — same system state → same report. No random behaviour, no telemetry, no analytics.
+- **Enforced, not promised** — the test suite parses the script, strips string literals, and fails if a `sudo`, a mutating command or a network client shows up in code that actually runs. The fix commands the tool prints are strings; the guard tells the difference.
 
 If you find anything concerning, please open an issue. We take this seriously.
+
+## Development
+
+```bash
+make check     # bash -n + shellcheck + the full test suite
+make test      # test suite only
+make lint      # syntax + shellcheck only
+```
+
+`tests/run-tests.sh` is pure Bash with no dependencies (shellcheck and python3
+are used when installed and skipped when not). It covers the check registry, the
+CLI contract, both report formats, and the read-only/offline static guards. CI
+runs it on macOS for every push and pull request.
+
+Adding a check is two steps: write a `check_<category>_<name>()` function, then
+append one line to the `CHECKS` array. The check number, category filter,
+`--list-checks`, `--help` and the run order all derive from that array.
 
 ## License
 

@@ -30,12 +30,18 @@ Fix commands belong **only** inside quoted strings shown to the user (in `show_f
 - Do not read file contents of keychains, credentials, browser data, etc.
 - Do not enumerate or display the _contents_ of `authorized_keys` — only count the lines.
 
-### 3. No Network Activity
+### 3. No Network Activity Unless Explicitly Requested
 
-- The script must work fully offline.
-- No telemetry, analytics, or update checks.
-- No `curl`, `wget`, `fetch`, `nc`, or any outbound connections.
+- The script must work fully offline, and does so by default.
+- No telemetry, analytics, or self-update checks — ever, in any mode.
+- No `curl`, `wget`, `fetch`, `nc`, or any outbound connection.
 - No DNS lookups (the script reads DNS _configuration_, it does not resolve anything).
+- **One exception**: `softwareupdate -l` asks Apple which updates are pending. It
+  is the only network-capable call in the script and it must stay inside
+  `if $ONLINE_MODE; then` (the `--online` flag, off by default). The offline path
+  reads the values macOS already cached. `tests/run-tests.sh` fails the build if
+  the call ever appears outside that branch, or if any other network client
+  appears anywhere.
 
 ### 4. No Dependencies
 
@@ -58,20 +64,28 @@ Fix commands belong **only** inside quoted strings shown to the user (in `show_f
 
 ### Output
 
-- Terminal output uses colour codes via the `PASS`, `FAIL`, `WARN`, `INFO` variables.
+- Terminal output uses colour codes via the `PASS`, `FAIL`, `WARN` variables.
 - Report output is clean Markdown with no ANSI escapes.
 - Every finding must have: a one-line summary (first arg) and a detailed explanation with fix (second arg).
+- Print through `qprint`, never bare `printf` — `--quiet` and `--json` depend on it.
 
 ### Adding a New Check
 
-1. Increment `TOTAL_CHECKS` at the top.
-2. Create a new `check_<category>_<name>()` function following the standardised pattern.
-3. Use `pass()`, `critical()`, `high()`, or `medium()` to record the finding.
-4. Add a `show_fix` call for the `--show-fix` flag, followed by the corresponding `_record_<severity>_json` call.
-5. Add the function call in the execution block with the next check number.
-6. Update `check_category()`, `list_checks()`, and `usage()` with the new check.
-7. Update the checks table in `README.md`.
-8. Add a release note entry.
+The `CHECKS` array near the top of the script is the single source of truth. The
+check number, the `--category` filter, `--list-checks`, `--help` and the run
+order are all derived from it.
+
+1. Write a `check_<category>_<name>()` function following the pattern of its
+   neighbours: read the setting, then call `pass()`, `critical()`, `high()` or
+   `medium()` with a one-line summary and a detail paragraph, optionally followed
+   by `show_fix "<description>" "<command>"`. `show_fix` attaches itself to the
+   finding recorded immediately before it, so it must come right after — there is
+   no separate JSON call to keep in sync.
+2. Append one line to `CHECKS`: `"<n>|<category>|<title>|<function>"`.
+
+Then update the checks table in `README.md` and add a release note entry. Run
+`make check` — the test suite verifies the numbering, uniqueness, that the
+function exists, and that no `check_*` function is orphaned from the registry.
 
 ---
 
@@ -80,32 +94,46 @@ Fix commands belong **only** inside quoted strings shown to the user (in `show_f
 ### Testing Changes
 
 ```bash
+make check     # bash -n + shellcheck + the full test suite — run this before every commit
+make test      # test suite only
+make lint      # syntax + shellcheck only
+
 # Run the audit locally (generates a report in cwd)
 ./bin/macos-security-audit
 
 # Run with fix suggestions visible
 ./bin/macos-security-audit --show-fix
-
-# Check for shell issues
-shellcheck bin/macos-security-audit
 ```
+
+`tests/run-tests.sh` is pure Bash and sources the script in library mode
+(`MSA_LIB_MODE=1`) to test the real registry and helpers rather than a copy. It
+also parses the script statically — stripping string literals and heredoc bodies
+first — so a mutating command in a quoted fix string passes while the same
+command in executable code fails the build.
+
+The guards were validated by mutation testing: injecting a `sudo`, a `curl`, a
+`launchctl unload`, a top-level `local`, an unguarded `softwareupdate`, a deleted
+registry line, a failing `EXIT` trap and a mis-wired JSON summary field were all
+caught. If you weaken a guard, re-run that exercise.
 
 ### Before Committing
 
+- [ ] `make check` is green (this covers shellcheck, the read-only guard, the
+      offline guard, the registry, the CLI contract and both report formats)
 - [ ] No `defaults write`, `rm`, `sudo`, or destructive commands outside of quoted fix strings
-- [ ] No network calls added
+- [ ] No network call added outside the `--online` branch
 - [ ] No new dependencies introduced
-- [ ] `shellcheck` passes (or deviations are justified)
-- [ ] Report output is valid Markdown
 - [ ] `--show-fix` shows correct commands for any new findings
-- [ ] `TOTAL_CHECKS` matches the actual number of check sections
-- [ ] Any generated `security-audit-*.md` files are NOT committed (they're in `.gitignore`)
+- [ ] `README.md` and `ReleaseNotes.md` reflect any behaviour change
+- [ ] Any generated `security-audit-*.md` / `.json` files are NOT committed (they're in `.gitignore`)
 
 ### What Gets Committed
 
 - `bin/macos-security-audit` — the script
+- `tests/run-tests.sh` — the test suite
+- `.github/workflows/ci.yml` — CI
 - `README.md`, `ReleaseNotes.md` — documentation
-- `Makefile` — install/uninstall targets
+- `Makefile` — install/uninstall/lint/test targets
 - `Formula/` — Homebrew formula
 - `CLAUDE.md` — this file
 - `.gitignore` — ignore patterns
@@ -137,7 +165,10 @@ If you are an AI agent working on this project:
 
 1. **Never generate or suggest running the audit script as part of a code change** — it reads real system state and the output contains sensitive machine info.
 2. **Never create test fixtures that contain real IPs, serial numbers, or usernames.**
-3. **Never add `curl`, `wget`, or any network call to the script.**
+3. **Never add `curl`, `wget`, or any network call to the script.** The single
+   `softwareupdate -l` behind `--online` is the whole budget; it is not a
+   precedent for a second one.
 4. **Always verify that new code is read-only** — if you add a check, it must only _read_ a setting, never _change_ one.
 5. **Do not commit `security-audit-*.md` files** — they contain machine-specific data.
 6. **Review the diff before committing** — ensure no sensitive output was accidentally captured.
+7. **Run `make check`** — do not report a change as done until it is green.
