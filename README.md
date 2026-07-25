@@ -378,11 +378,12 @@ make lint      # syntax + shellcheck only
 ```
 
 `tests/run-tests.sh` is pure Bash with no dependencies (shellcheck and python3
-are used when installed and skipped when not). Its 117 tests cover the check
+are used when installed and skipped when not). Its 118 tests cover the check
 registry, the CLI contract, every pure helper, both report formats, the baseline
 diff, all five attack chains, and the read-only/offline static guards. CI runs it
 on macOS for every push and pull request, and separately runs shellcheck at
-`-S style` — its strictest level — over both the script and the suite.
+`-S style` — its strictest level — over both the script and the suite, at a
+pinned version so the build never breaks on a linter upgrade nobody made.
 
 Adding a check is two steps: write a `check_<category>_<name>()` function, then
 append one line to the `CHECKS` array. The check number, category filter,

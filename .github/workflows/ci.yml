@@ -52,7 +52,19 @@ jobs:
   shellcheck-strict:
     name: shellcheck (style level)
     runs-on: ubuntu-latest
+    env:
+      SHELLCHECK_VERSION: v0.11.0
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      # Pinned deliberately. apt's shellcheck lags several releases behind the
+      # one this repo is verified against, and the two disagree about which
+      # style-level rules fire — so an unpinned strict job fails on a linter
+      # upgrade nobody made, on a commit that changed nothing related.
+      - name: Install shellcheck ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" | tar -xJ
+          sudo install "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version | sed -n 2p
+
       - run: shellcheck -S style bin/macos-security-audit tests/run-tests.sh

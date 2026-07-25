@@ -519,6 +519,39 @@ assert_eq "every fired chain has a body" "${#CHAIN_TITLES[@]}" "${#CHAIN_BODIES[
 # counted once by the check that recorded it.
 assert_eq "attack chains do not change the score" "$_SCORE_BEFORE" "$SCORE"
 
+# The JSON path with a non-empty attack_chains array was unexercised until CI
+# ran on a machine where a chain actually fired. Render it here, where the
+# fixtures guarantee five of them, rather than hoping the host misbehaves.
+if command -v python3 >/dev/null 2>&1; then
+    # main() fills these in from the real machine; the fixture uses constants so
+    # the assertion never depends on the host and no serial reaches the log.
+    # shellcheck disable=SC2034  # read by the sourced script, not by this one
+    {
+        TIMESTAMP="2000-01-01T00:00:00Z"; HW_MODEL="Fixture"; HW_CHIP="Fixture"
+        OS_VERSION="0.0"; OS_BUILD="0A0"; SERIAL_OUT="REDACTED"
+        GRADE=$(letter_grade "$SCORE"); ACTIVE_CHECKS=$TOTAL_CHECKS
+    }
+    if CHAIN_JSON_ERR=$(render_json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+c = d.get("attack_chains")
+errs = []
+if not isinstance(c, list) or len(c) != 5:
+    errs.append("expected 5 chains in the JSON, got %r" % (c,))
+else:
+    for x in c:
+        if not x.get("title") or not x.get("detail"):
+            errs.append("chain missing title or detail: %r" % (x,))
+print("\n".join(errs), end="")
+' 2>&1); then
+        assert_empty "render_json stays parseable when chains fire" "$CHAIN_JSON_ERR"
+    else
+        bad "render_json stays parseable when chains fire" "$CHAIN_JSON_ERR"
+    fi
+else
+    skip "python3 not installed — attack chain JSON shape"
+fi
+
 _reset_findings
 _fake_finding 1  pass "FileVault is OFF"
 _fake_finding 22 pass "Auto-login is ENABLED"
@@ -662,19 +695,27 @@ PY
 
     # Without --baseline the key must still exist, as null — a consumer should
     # not have to guess whether a missing key means "no diff" or "old version".
+    # attack_chains is asserted on shape only: whether a chain fires depends on
+    # the machine the suite runs on, and the chain logic itself is covered by
+    # the fixture tests in "Helper functions".
     if PY_ERR=$(python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
 errs = []
 if "baseline" not in d or d["baseline"] is not None:
     errs.append("baseline should be null without --baseline, got %r" % d.get("baseline"))
-if d.get("attack_chains") != []:
-    errs.append("attack_chains should be [] when no chain fires, got %r" % d.get("attack_chains"))
+chains = d.get("attack_chains")
+if not isinstance(chains, list):
+    errs.append("attack_chains should always be an array, got %r" % chains)
+else:
+    for c in chains:
+        if not isinstance(c, dict) or not c.get("title") or not c.get("detail"):
+            errs.append("each attack chain needs a title and a detail, got %r" % c)
 print("\n".join(errs), end="")
 ' "$JSON" 2>&1); then
-        assert_empty "JSON carries baseline:null and attack_chains:[] by default" "$PY_ERR"
+        assert_empty "JSON carries baseline:null and well-formed attack_chains" "$PY_ERR"
     else
-        bad "JSON carries baseline:null and attack_chains:[] by default" "$PY_ERR"
+        bad "JSON carries baseline:null and well-formed attack_chains" "$PY_ERR"
     fi
 else
     skip "python3 not installed — baseline JSON shape"
@@ -685,22 +726,24 @@ group "Repository hygiene"
 ###############################################################################
 
 if command -v git >/dev/null 2>&1 && [[ -d "$ROOT/.git" ]]; then
-    TRACKED_REPORTS=$(cd "$ROOT" && git ls-files | command grep 'security-audit-' || true)
+    # git -C rather than 'cd "$ROOT" && git', which is the A && B || C shape
+    # that older shellcheck releases flag as SC2015.
+    TRACKED_REPORTS=$(git -C "$ROOT" ls-files | command grep 'security-audit-' || true)
     assert_empty "no generated report is tracked by git" "$TRACKED_REPORTS"
 
     IGNORE_MISSES=""
     for _pattern in security-audit-2000-01-01.md security-audit-2000-01-01.json; do
-        (cd "$ROOT" && git check-ignore -q "$_pattern") || IGNORE_MISSES="${IGNORE_MISSES}$_pattern "
+        git -C "$ROOT" check-ignore -q "$_pattern" || IGNORE_MISSES="${IGNORE_MISSES}$_pattern "
     done
     assert_empty "generated reports are gitignored (.md and .json)" "$IGNORE_MISSES"
 
     # Every GitHub link the project hands out — brew tap instructions, the
     # formula url, the report footer — must name the repository that actually
     # exists. They pointed at a 404 for three releases.
-    ORIGIN=$(cd "$ROOT" && git remote get-url origin 2>/dev/null || true)
+    ORIGIN=$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)
     if [[ -n "$ORIGIN" ]]; then
         SLUG=$(printf '%s' "$ORIGIN" | sed -e 's#.*github\.com[:/]##' -e 's#\.git$##')
-        WRONG_URLS=$(cd "$ROOT" && git grep -hoE 'github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' -- \
+        WRONG_URLS=$(git -C "$ROOT" grep -hoE 'github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' -- \
             README.md CLAUDE.md ReleaseNotes.md Formula bin 2>/dev/null \
             | sed -e 's#github\.com/##' -e 's#\.git$##' | sort -u | command grep -vx "$SLUG" || true)
         assert_empty "every github.com link points at origin ($SLUG)" "$WRONG_URLS"
