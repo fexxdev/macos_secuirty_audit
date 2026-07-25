@@ -1533,6 +1533,18 @@ check_privacy_analytics() {
         ANALYTICS_NAMES="${ANALYTICS_NAMES}Share with App Developers, "
     fi
 
+    # "Improve Assistive Voice Features" — System Settings > Accessibility, and
+    # mirrored in Analytics & Improvements. Key identified by flipping the
+    # toggle and diffing the preference domains: com.apple.Accessibility gains
+    # AXSAudioDonationSiriImprovementEnabled = 1. Only 1 counts as ON; the
+    # off-state value was never observed and guessing it is precisely how the
+    # Siri check below ended up backwards.
+    VOICE_DONATION=$(defaults read com.apple.Accessibility AXSAudioDonationSiriImprovementEnabled 2>/dev/null || echo "")
+    if [[ "$VOICE_DONATION" == "1" ]]; then
+        ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Improve Assistive Voice Features is ON — audio and transcripts of your Voice Control and Vocal Shortcuts interactions go to Apple\n"
+        ANALYTICS_NAMES="${ANALYTICS_NAMES}Improve Assistive Voice Features, "
+    fi
+
     SIRI_DATA=$(defaults read com.apple.assistant.support "Siri Data Sharing Opt-In Status" 2>/dev/null || echo "")
     if [[ "$(siri_sharing_state "$SIRI_DATA")" == "on" ]]; then
         ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Improve Siri & Dictation is ON — audio recordings of your Siri and dictation requests may be stored and reviewed\n"
@@ -1552,9 +1564,15 @@ here are sending anything.
 
 System Settings > Privacy & Security > Analytics & Improvements
 
-  - \"Share Mac Analytics\"          -> off
-  - \"Share with App Developers\"    -> off  (greyed out until the first is off)
-  - \"Improve Siri & Dictation\"     -> off
+  - \"Share Mac Analytics\"              -> off
+  - \"Improve Siri & Dictation\"         -> off
+  - \"Improve Assistive Voice Features\" -> off
+  - \"Share with app developers\"        -> off  (greyed out until the first is off)
+  - \"Share iCloud Analytics\"           -> off
+
+\"Share iCloud Analytics\" is the one toggle this check cannot read: it is stored
+with your Apple Account rather than in a local preference file, so verify that
+one by eye in the pane.
 
 **Or from the terminal:**
 
@@ -1562,6 +1580,7 @@ System Settings > Privacy & Security > Analytics & Improvements
 sudo defaults write '$CRASH_PLIST' AutoSubmit -bool false
 sudo defaults write '$CRASH_PLIST' ThirdPartyDataSubmit -bool false
 defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 2
+defaults write com.apple.Accessibility AXSAudioDonationSiriImprovementEnabled -bool false
 \`\`\`
 
 (\`-int 2\` is the explicit opt-out. \`0\` means \"never asked\" and makes macOS
@@ -1574,11 +1593,14 @@ these values and will keep showing the old state until you do.
 **Turning off \"Improve Siri & Dictation\" does not delete what Apple already
 has.** To erase past recordings: System Settings > Siri & Spotlight > Siri
 History > Delete Siri & Dictation History."
+        # Breakdown first, then the fix block — otherwise --show-fix wedges four
+        # commands between the summary and the list of what they are fixing.
+        qprint "%b" "${ANALYTICS_ISSUES//  - /          - }"
         show_fix "Disable analytics sharing" \
             "sudo defaults write '$CRASH_PLIST' AutoSubmit -bool false" \
             "sudo defaults write '$CRASH_PLIST' ThirdPartyDataSubmit -bool false" \
-            "defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 2"
-        qprint "%b" "${ANALYTICS_ISSUES//  - /          - }"
+            "defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 2" \
+            "defaults write com.apple.Accessibility AXSAudioDonationSiriImprovementEnabled -bool false"
     else
         pass "Analytics & telemetry sharing appears disabled"
     fi
