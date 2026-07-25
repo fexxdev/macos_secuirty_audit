@@ -331,6 +331,15 @@ assert_eq "firewall_state falls back to the sentence" "2" \
 assert_eq "firewall_state reports unknown on empty output" "unknown" "$(firewall_state '')"
 assert_eq "firewall_state reports unknown on garbage" "unknown" "$(firewall_state 'command not found')"
 
+# The value that was read as "sharing is ON" is the one macOS writes when you
+# opt OUT. Verified against the Analytics & Improvements pane.
+assert_eq "siri_sharing_state: 1 is opted in"        "on"        "$(siri_sharing_state 1)"
+assert_eq "siri_sharing_state: 2 is opted OUT"       "off"       "$(siri_sharing_state 2)"
+assert_eq "siri_sharing_state: 0 is never asked"     "not-asked" "$(siri_sharing_state 0)"
+assert_eq "siri_sharing_state: unset is never asked" "not-asked" "$(siri_sharing_state '')"
+# An unrecognised value must not read as "on" — that is how the bug shipped.
+assert_eq "siri_sharing_state: anything else is unknown" "unknown" "$(siri_sharing_state 7)"
+
 assert_eq "days_label 1 is singular"  "1 day"   "$(days_label 1)"
 assert_eq "days_label 0 is plural"    "0 days"  "$(days_label 0)"
 assert_eq "days_label 42 is plural"   "42 days" "$(days_label 42)"

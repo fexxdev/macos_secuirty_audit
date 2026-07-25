@@ -458,6 +458,25 @@ daemon_loaded() { launchctl list "$1" &>/dev/null; }
 # "1 day" not "1 days" — a stray plural makes the report read like a draft.
 days_label() { if (( $1 == 1 )); then printf '1 day'; else printf '%s days' "$1"; fi; }
 
+# "Siri Data Sharing Opt-In Status" is an enum, not a boolean, and this check
+# had its polarity backwards — it flagged 2 as ON when 2 is what macOS writes
+# when you opt *out*. Confirmed against System Settings > Privacy & Security >
+# Analytics & Improvements on a machine reading 2: the toggle was off.
+#     unset / 0 = never asked
+#     1         = opted in  (sharing ON)
+#     2         = opted out (sharing OFF)
+# Only 1 is reported. An unrecognised value is not evidence that anything is
+# being shared, and treating "not the value I expected" as ON is exactly what
+# produced the false positive.
+siri_sharing_state() {
+    case "$1" in
+        1) printf 'on' ;;
+        2) printf 'off' ;;
+        0|"") printf 'not-asked' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
 # socketfilterfw prints one of three sentences, and only one of them contains
 # the word "enabled":
 #     Firewall is disabled. (State = 0)
@@ -1514,8 +1533,8 @@ check_privacy_analytics() {
         ANALYTICS_NAMES="${ANALYTICS_NAMES}Share with App Developers, "
     fi
 
-    SIRI_DATA=$(defaults read com.apple.assistant.support "Siri Data Sharing Opt-In Status" 2>/dev/null || echo "unknown")
-    if [[ "$SIRI_DATA" == "2" ]]; then
+    SIRI_DATA=$(defaults read com.apple.assistant.support "Siri Data Sharing Opt-In Status" 2>/dev/null || echo "")
+    if [[ "$(siri_sharing_state "$SIRI_DATA")" == "on" ]]; then
         ANALYTICS_ISSUES="${ANALYTICS_ISSUES}  - Improve Siri & Dictation is ON — audio recordings of your Siri and dictation requests may be stored and reviewed\n"
         ANALYTICS_NAMES="${ANALYTICS_NAMES}Improve Siri & Dictation, "
     fi
@@ -1542,8 +1561,11 @@ System Settings > Privacy & Security > Analytics & Improvements
 \`\`\`
 sudo defaults write '$CRASH_PLIST' AutoSubmit -bool false
 sudo defaults write '$CRASH_PLIST' ThirdPartyDataSubmit -bool false
-defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 0
+defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 2
 \`\`\`
+
+(\`-int 2\` is the explicit opt-out. \`0\` means \"never asked\" and makes macOS
+prompt again.)
 
 The first two write a file under /Library and need \`sudo\`; the Siri one is
 per-user and does not. Log out and back in afterwards — the settings pane caches
@@ -1555,7 +1577,7 @@ History > Delete Siri & Dictation History."
         show_fix "Disable analytics sharing" \
             "sudo defaults write '$CRASH_PLIST' AutoSubmit -bool false" \
             "sudo defaults write '$CRASH_PLIST' ThirdPartyDataSubmit -bool false" \
-            "defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 0"
+            "defaults write com.apple.assistant.support 'Siri Data Sharing Opt-In Status' -int 2"
         qprint "%b" "${ANALYTICS_ISSUES//  - /          - }"
     else
         pass "Analytics & telemetry sharing appears disabled"
